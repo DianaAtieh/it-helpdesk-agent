@@ -1,0 +1,20 @@
+# secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# your vector index / caches (rebuild them from dataset/)
+*.npz
+.chroma/
+chroma_db/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+# Keep the dataset byte-identical across operating systems (later lines win)
+dataset/** text eol=lf
+*.pdf binary
+*.png binary

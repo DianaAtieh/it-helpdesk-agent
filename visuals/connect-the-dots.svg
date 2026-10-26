@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs><marker id="ah0078d4" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#0078d4"/></marker><marker id="ah2e7d32" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#2e7d32"/></marker><marker id="ah7a43b6" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#7a43b6"/></marker><marker id="ahc98a00" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c98a00"/></marker><marker id="ah00838f" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#00838f"/></marker><marker id="ah5c5c5c" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#5c5c5c"/></marker><marker id="ah1a3c5e" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#1a3c5e"/></marker><marker id="ah605e5c" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#605e5c"/></marker><marker id="ahc50f1f" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c50f1f"/></marker></defs>
+<rect width="1600" height="900" fill="#ffffff"/>
+<text x="40" y="52" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#1a3c5e">Connect the dots: every module is a layer of one real system</text>
+<text x="40" y="86" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16.5" fill="#605e5c">You didn&#x27;t take thirteen separate courses. You collected the parts of one machine. This week you assemble it.</text>
+<rect x="40" y="100" width="90" height="4" rx="2" fill="#0078d4"/>
+<rect x="1060" y="128" width="500" height="74" rx="10" fill="#ffffff" stroke="#1a3c5e" stroke-width="2.5"/>
+<rect x="1060" y="128" width="10" height="74" rx="4" fill="#1a3c5e"/>
+<rect x="1060" y="212" width="500" height="74" rx="10" fill="#ffffff" stroke="#0078d4" stroke-width="2.5"/>
+<rect x="1060" y="212" width="10" height="74" rx="4" fill="#0078d4"/>
+<rect x="1060" y="296" width="500" height="74" rx="10" fill="#ffffff" stroke="#7a43b6" stroke-width="2.5"/>
+<rect x="1060" y="296" width="10" height="74" rx="4" fill="#7a43b6"/>
+<rect x="1060" y="380" width="500" height="74" rx="10" fill="#ffffff" stroke="#c98a00" stroke-width="2.5"/>
+<rect x="1060" y="380" width="10" height="74" rx="4" fill="#c98a00"/>
+<rect x="1060" y="464" width="500" height="74" rx="10" fill="#ffffff" stroke="#00838f" stroke-width="2.5"/>
+<rect x="1060" y="464" width="10" height="74" rx="4" fill="#00838f"/>
+<rect x="1060" y="548" width="500" height="74" rx="10" fill="#ffffff" stroke="#c50f1f" stroke-width="2.5"/>
+<rect x="1060" y="548" width="10" height="74" rx="4" fill="#c50f1f"/>
+<rect x="1060" y="632" width="500" height="74" rx="10" fill="#ffffff" stroke="#2e7d32" stroke-width="2.5"/>
+<rect x="1060" y="632" width="10" height="74" rx="4" fill="#2e7d32"/>
+<rect x="1060" y="716" width="500" height="74" rx="10" fill="#ffffff" stroke="#5c5c5c" stroke-width="2.5"/>
+<rect x="1060" y="716" width="10" height="74" rx="4" fill="#5c5c5c"/>
+<rect x="40" y="130" width="360" height="42" rx="21" fill="#ffffff" stroke="#1a3c5e" stroke-width="2"/>
+<rect x="40" y="130" width="64" height="42" rx="21" fill="#1a3c5e"/>
+<rect x="40" y="182" width="360" height="42" rx="21" fill="#ffffff" stroke="#0078d4" stroke-width="2"/>
+<rect x="40" y="182" width="64" height="42" rx="21" fill="#0078d4"/>
+<rect x="40" y="234" width="360" height="42" rx="21" fill="#ffffff" stroke="#7a43b6" stroke-width="2"/>
+<rect x="40" y="234" width="64" height="42" rx="21" fill="#7a43b6"/>
+<rect x="40" y="286" width="360" height="42" rx="21" fill="#ffffff" stroke="#7a43b6" stroke-width="2"/>
+<rect x="40" y="286" width="64" height="42" rx="21" fill="#7a43b6"/>
+<rect x="40" y="338" width="360" height="42" rx="21" fill="#ffffff" stroke="#7a43b6" stroke-width="2"/>
+<rect x="40" y="338" width="64" height="42" rx="21" fill="#7a43b6"/>
+<rect x="40" y="390" width="360" height="42" rx="21" fill="#ffffff" stroke="#7a43b6" stroke-width="2"/>
+<rect x="40" y="390" width="64" height="42" rx="21" fill="#7a43b6"/>
+<rect x="40" y="442" width="360" height="42" rx="21" fill="#ffffff" stroke="#c98a00" stroke-width="2"/>
+<rect x="40" y="442" width="64" height="42" rx="21" fill="#c98a00"/>
+<rect x="40" y="494" width="360" height="42" rx="21" fill="#ffffff" stroke="#c98a00" stroke-width="2"/>
+<rect x="40" y="494" width="64" height="42" rx="21" fill="#c98a00"/>
+<rect x="40" y="546" width="360" height="42" rx="21" fill="#ffffff" stroke="#00838f" stroke-width="2"/>
+<rect x="40" y="546" width="64" height="42" rx="21" fill="#00838f"/>
+<rect x="40" y="598" width="360" height="42" rx="21" fill="#ffffff" stroke="#00838f" stroke-width="2"/>
+<rect x="40" y="598" width="64" height="42" rx="21" fill="#00838f"/>
+<rect x="40" y="650" width="360" height="42" rx="21" fill="#ffffff" stroke="#c50f1f" stroke-width="2"/>
+<rect x="40" y="650" width="64" height="42" rx="21" fill="#c50f1f"/>
+<rect x="40" y="702" width="360" height="42" rx="21" fill="#ffffff" stroke="#c50f1f" stroke-width="2"/>
+<rect x="40" y="702" width="64" height="42" rx="21" fill="#c50f1f"/>
+<rect x="40" y="754" width="360" height="42" rx="21" fill="#ffffff" stroke="#2e7d32" stroke-width="2"/>
+<rect x="40" y="754" width="64" height="42" rx="21" fill="#2e7d32"/>
+<path d="M402.0,151.0 C729.0,151.0 729.0,165.0 1056.0,165.0" fill="none" stroke="#1a3c5e" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah1a3c5e)"/>
+<path d="M402.0,203.0 C729.0,203.0 729.0,249.0 1056.0,249.0" fill="none" stroke="#0078d4" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah0078d4)"/>
+<path d="M402.0,203.0 C729.0,203.0 729.0,753.0 1056.0,753.0" fill="none" stroke="#5c5c5c" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah5c5c5c)"/>
+<path d="M402.0,255.0 C729.0,255.0 729.0,333.0 1056.0,333.0" fill="none" stroke="#7a43b6" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah7a43b6)"/>
+<path d="M402.0,307.0 C729.0,307.0 729.0,333.0 1056.0,333.0" fill="none" stroke="#7a43b6" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah7a43b6)"/>
+<path d="M402.0,359.0 C729.0,359.0 729.0,333.0 1056.0,333.0" fill="none" stroke="#7a43b6" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah7a43b6)"/>
+<path d="M402.0,411.0 C729.0,411.0 729.0,333.0 1056.0,333.0" fill="none" stroke="#7a43b6" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah7a43b6)"/>
+<path d="M402.0,463.0 C729.0,463.0 729.0,417.0 1056.0,417.0" fill="none" stroke="#c98a00" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ahc98a00)"/>
+<path d="M402.0,515.0 C729.0,515.0 729.0,417.0 1056.0,417.0" fill="none" stroke="#c98a00" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ahc98a00)"/>
+<path d="M402.0,567.0 C729.0,567.0 729.0,501.0 1056.0,501.0" fill="none" stroke="#00838f" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah00838f)"/>
+<path d="M402.0,619.0 C729.0,619.0 729.0,501.0 1056.0,501.0" fill="none" stroke="#00838f" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah00838f)"/>
+<path d="M402.0,619.0 C729.0,619.0 729.0,753.0 1056.0,753.0" fill="none" stroke="#5c5c5c" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah5c5c5c)"/>
+<path d="M402.0,671.0 C729.0,671.0 729.0,585.0 1056.0,585.0" fill="none" stroke="#c50f1f" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ahc50f1f)"/>
+<path d="M402.0,723.0 C729.0,723.0 729.0,585.0 1056.0,585.0" fill="none" stroke="#c50f1f" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ahc50f1f)"/>
+<path d="M402.0,775.0 C729.0,775.0 729.0,669.0 1056.0,669.0" fill="none" stroke="#2e7d32" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#ah2e7d32)"/>
+<path d="M470,800 L976,800 L990,814 L990,862 L470,862 Z" fill="#fff8c5" stroke="#d4b106" stroke-width="1.5"/><path d="M976,800 L976,814 L990,814" fill="none" stroke="#d4b106" stroke-width="1.5"/><text x="482" y="821.9" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#4d4000">This week is integration, not a rewrite. Open your old labs: the file worth</text><text x="482" y="840.1" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#4d4000">reopening for each layer is in CONNECT-THE-DOTS.md.</text>
+<text x="1086" y="152.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#1a3c5e">1  Interface</text>
+<text x="1086" y="178.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">how does a person use it?  the kit&#x27;s UI starter, or yours</text>
+<text x="1086" y="236.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#0078d4">2  Entry point</text>
+<text x="1086" y="262.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">how does anyone call it?  FastAPI + the contract</text>
+<text x="1086" y="320.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#7a43b6">3  Orchestration</text>
+<text x="1086" y="346.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">who does what, in which order, until when?</text>
+<text x="1086" y="404.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#c98a00">4  Tools through MCP</text>
+<text x="1086" y="430.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">how does it act on the client&#x27;s systems?</text>
+<text x="1086" y="488.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#00838f">5  Knowledge &amp; memory</text>
+<text x="1086" y="514.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">what does it know and remember?</text>
+<text x="1086" y="572.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#c50f1f">6  Guardrails &amp; approvals</text>
+<text x="1086" y="598.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">what must it never do, and who says yes?</text>
+<text x="1086" y="656.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#2e7d32">7  Evaluation &amp; observability</text>
+<text x="1086" y="682.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">how do we know it works, and why it failed?</text>
+<text x="1086" y="740.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#5c5c5c">8  Deployment</text>
+<text x="1086" y="766.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#3b3a39">can someone else start it with one command?</text>
+<text x="40" y="118.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#605e5c">WHAT YOU LEARNED</text>
+<text x="1060" y="116.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#605e5c">WHAT A REAL AGENTIC SYSTEM NEEDS</text>
+<text x="72" y="151.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">Kit</text>
+<text x="116" y="151.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">UI starter (ui/app_ui.py)</text>
+<text x="72" y="203.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M12</text>
+<text x="116" y="203.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Deployment: FastAPI, Docker, pins</text>
+<text x="72" y="255.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M1</text>
+<text x="116" y="255.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">The agent loop</text>
+<text x="72" y="307.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M2</text>
+<text x="116" y="307.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">LangGraph &amp; CrewAI</text>
+<text x="72" y="359.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M3</text>
+<text x="116" y="359.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">ReAct &amp; planning</text>
+<text x="72" y="411.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M7</text>
+<text x="116" y="411.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Multi-agent: teams, managers, A2A</text>
+<text x="72" y="463.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M5</text>
+<text x="116" y="463.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Tools &amp; MCP</text>
+<text x="72" y="515.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M5B</text>
+<text x="116" y="515.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Agent skills</text>
+<text x="72" y="567.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M6</text>
+<text x="116" y="567.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Memory: embeddings + a store</text>
+<text x="72" y="619.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M13</text>
+<text x="116" y="619.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Agents in the cloud (Foundry)</text>
+<text x="72" y="671.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M4</text>
+<text x="116" y="671.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Reflection &amp; self-critique</text>
+<text x="72" y="723.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M11</text>
+<text x="116" y="723.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Guardrails, safety &amp; cost</text>
+<text x="72" y="775.0" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#ffffff">M10</text>
+<text x="116" y="775.0" text-anchor="start" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#323130">Evaluation &amp; observability</text>
+<text x="1570" y="878" text-anchor="end" dominant-baseline="central" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#a19f9d">JHF Agentic AI Bootcamp · The Ship Week</text>
+</svg>

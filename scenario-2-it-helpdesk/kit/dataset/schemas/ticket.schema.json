@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://help.nakhla.example/schemas/ticket.schema.json",
+  "title": "New IT ticket (body of POST /api/tickets)",
+  "description": "Nakhla Systems (fictional) helpdesk. The top level is the body you send to create a ticket. $defs.ticket_record is the stored ticket the API returns (and the shape of tickets/historical_tickets.json). The API lower-cases requester_email before validating.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["subject", "description", "category", "priority", "requester_email", "department", "attempted_steps", "kb_refs"],
+  "properties": {
+    "subject": {"type": "string", "minLength": 5, "maxLength": 120, "description": "One line. Include the error code if there is one."},
+    "description": {"type": "string", "minLength": 10, "maxLength": 4000, "description": "The symptom in the employee's words, plus context: error code, OS, client version, office, since when."},
+    "category": {"$ref": "#/$defs/category"},
+    "priority": {"$ref": "#/$defs/priority"},
+    "requester_email": {"type": "string", "pattern": "^[a-z0-9._-]+@nakhla\\.example$", "description": "Must exist in the directory (GET /api/directory/{email})."},
+    "department": {"$ref": "#/$defs/department", "description": "Must match the requester's department in the directory."},
+    "attempted_steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "minLength": 3, "maxLength": 300}, "description": "What was already tried (at least one step)."},
+    "kb_refs": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/doc_id"}, "description": "KB/SP ids that were followed. Each must exist. Empty when the KB has no answer."},
+    "affected_users": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 1, "description": "Optional. How many people have the same problem (drives P1 in KB-015)."}
+  },
+  "$defs": {
+    "category": {"enum": ["network_access", "identity_access", "hardware", "software", "email_collab", "security", "onboarding", "other"]},
+    "priority": {"enum": ["P1", "P2", "P3", "P4"]},
+    "department": {"enum": ["Engineering", "Finance", "HR", "Sales", "Support", "Executive Office", "Contractors"]},
+    "team": {"enum": ["Network Operations", "Identity & Access Management", "Endpoint Engineering", "Collaboration Services", "Security Operations", "IT Service Desk"]},
+    "doc_id": {"type": "string", "pattern": "^(KB|SP)-\\d{3}$"},
+    "timestamp": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"},
+    "note": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "author", "text"],
+      "properties": {
+        "at": {"$ref": "#/$defs/timestamp"},
+        "author": {"type": "string", "minLength": 2, "maxLength": 80},
+        "text": {"type": "string", "minLength": 1, "maxLength": 2000}
+      }
+    },
+    "ticket_record": {
+      "title": "Stored ticket",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticket_id", "subject", "description", "category", "priority", "status", "requester_email", "department",
+                   "affected_users", "assigned_team", "attempted_steps", "kb_refs", "resolution", "created_at", "resolved_at", "notes"],
+      "properties": {
+        "ticket_id": {"type": "string", "pattern": "^IT-\\d{4}$"},
+        "subject": {"type": "string", "minLength": 5, "maxLength": 120},
+        "description": {"type": "string", "minLength": 10, "maxLength": 4000},
+        "category": {"$ref": "#/$defs/category"},
+        "priority": {"$ref": "#/$defs/priority"},
+        "status": {"enum": ["open", "resolved", "closed"]},
+        "requester_email": {"type": "string", "pattern": "^[a-z0-9._-]+@nakhla\\.example$"},
+        "department": {"$ref": "#/$defs/department"},
+        "affected_users": {"type": "integer", "minimum": 1},
+        "assigned_team": {"$ref": "#/$defs/team", "description": "Derived from the category (KB-015 section 3)."},
+        "attempted_steps": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "kb_refs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/doc_id"}},
+        "resolution": {"type": ["string", "null"]},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "resolved_at": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}]},
+        "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}},
+        "warnings": {"type": "array", "items": {"type": "string"}, "description": "Only on tickets created through the API, e.g. a kb_ref that is deprecated."}
+      }
+    }
+  }
+}

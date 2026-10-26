@@ -1,0 +1,30 @@
+# Simulated systems for the IT Helpdesk Agent mini-project.
+# One venv for the kit AND your agent. Tested together on Python 3.12 (Windows) with:
+#   pip install -r requirements.txt
+
+# Simulated helpdesk API + MCP server
+fastapi==0.141.1
+uvicorn==0.52.1
+jsonschema==4.26.0
+httpx==0.28.1
+mcp==1.28.1
+pydantic==2.12.5
+# pydantic-settings 2.15+ makes mcp 1.28.1 print a harmless IncompleteFieldDefinitionWarning
+pydantic-settings==2.14.2
+
+# Dataset: YAML front matter and PDF parsing (validator, your ingestion)
+PyYAML==6.0.3
+pymupdf==1.28.2
+
+# UI starter (ui/app_ui.py)
+gradio==6.30.0
+
+# Retrieval helpers: .env loading and vector math (a Module 6 style store)
+python-dotenv==1.2.4
+numpy==2.5.4
+
+# Your agent framework (the versions the course used)
+# LangGraph (or plain Python) for the agent; the openai SDK talks to OpenRouter
+# (chat + embeddings). evals/run_evals.py --judge also uses openai.
+langgraph==1.2.10
+openai==2.52.0

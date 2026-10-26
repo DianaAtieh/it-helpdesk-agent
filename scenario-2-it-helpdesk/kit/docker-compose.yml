@@ -1,0 +1,29 @@
+# Simulated systems for the IT Helpdesk Agent mini-project.
+#   docker compose up --build       -> helpdesk API on http://localhost:8102
+# Add your own app below (uncomment the app: block) so one command starts everything.
+services:
+  helpdesk-api:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    ports:
+      - "8102:8102"
+    environment:
+      HELPDESK_API_KEY: ${HELPDESK_API_KEY:-dev-key-change-me}
+      HELPDESK_TODAY: ${HELPDESK_TODAY:-}
+    restart: unless-stopped
+
+  # app:
+  #   build: .                      # your Dockerfile: your FastAPI app on port 8000
+  #   ports:
+  #     - "8000:8000"
+  #   env_file: .env
+  #   environment:
+  #     # inside compose the API is reached by its service name, not localhost
+  #     HELPDESK_API_URL: http://helpdesk-api:8102
+  #     HELPDESK_API_KEY: ${HELPDESK_API_KEY:-dev-key-change-me}
+  #   # your image must contain services/helpdesk_mcp.py, mcp and httpx: your app starts
+  #   # the MCP server as a subprocess (python -m services.helpdesk_mcp) over stdio
+  #   depends_on:
+  #     helpdesk-api:
+  #       condition: service_healthy

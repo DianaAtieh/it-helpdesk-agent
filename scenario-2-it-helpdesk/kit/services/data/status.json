@@ -1,0 +1,57 @@
+{
+  "_comment": "Simulated status page of Nakhla Systems (fictional). {TODAY} and {TODAY-N} are replaced with HELPDESK_TODAY (or N days before) when the API loads this file. Served by GET /api/status.",
+  "page_url": "https://status.nakhla.example",
+  "services": [
+    {"id": "vpn", "name": "NakhlaConnect VPN", "status": "degraded",
+     "components": [
+       {"id": "GW-1", "name": "Gateway GW-1 (Jerusalem)", "status": "operational"},
+       {"id": "GW-2", "name": "Gateway GW-2 (Ramallah)", "status": "degraded"},
+       {"id": "GW-3", "name": "Gateway GW-3 (Finance, FIN-SECURE)", "status": "operational"}
+     ]},
+    {"id": "nakhlaid", "name": "NakhlaID sign-in, SSO and NakhlaKey", "status": "operational", "components": []},
+    {"id": "wifi", "name": "Office Wi-Fi (Jerusalem HQ, Ramallah office)", "status": "operational", "components": []},
+    {"id": "mail", "name": "Nakhla Mail", "status": "operational", "components": []},
+    {"id": "print", "name": "NakhlaPrint", "status": "operational", "components": []},
+    {"id": "software", "name": "Software Center", "status": "operational", "components": []},
+    {"id": "mdm", "name": "NakhlaManage", "status": "operational", "components": []},
+    {"id": "vdi", "name": "Nakhla Workspace (VDI portal)", "status": "operational", "components": []}
+  ],
+  "incidents": [
+    {
+      "id": "INC-2207",
+      "status": "active",
+      "priority": "P1",
+      "service": "vpn",
+      "title": "VPN gateway GW-2 degraded",
+      "started_at": "{TODAY}T06:40:00Z",
+      "last_update": "{TODAY}T08:15:00Z",
+      "affected": "Employees connected through gateway GW-2 (Ramallah office and remote staff assigned to GW-2).",
+      "symptoms": "NakhlaConnect shows NX-503 or disconnects every few minutes.",
+      "error_codes": ["NX-503"],
+      "workaround": "In NakhlaConnect open Settings > Gateway and select GW-1 (Jerusalem), then reconnect. Finance users stay on GW-3 and are not affected.",
+      "instructions": "Do not open individual tickets for this problem. Add yourself to INC-2207 on the status page (Affected? > Subscribe) to get updates.",
+      "updates": [
+        {"at": "{TODAY}T06:55:00Z", "text": "Investigating reports of NX-503 on GW-2."},
+        {"at": "{TODAY}T08:15:00Z", "text": "A failed load balancer node on GW-2 has been identified. Network Operations is replacing it. Use GW-1 meanwhile."}
+      ]
+    },
+    {
+      "id": "INC-2198",
+      "status": "resolved",
+      "priority": "P1",
+      "service": "mail",
+      "title": "Delayed inbound external email",
+      "started_at": "{TODAY-4}T07:15:00Z",
+      "resolved_at": "{TODAY-4}T11:50:00Z",
+      "affected": "All employees receiving email from outside nakhla.example.",
+      "symptoms": "External messages arrived up to 4 hours late; senders saw NXM-421 delay notices.",
+      "error_codes": ["NXM-421"],
+      "workaround": null,
+      "instructions": "Resolved. Delayed messages were delivered. No action needed.",
+      "updates": [
+        {"at": "{TODAY-4}T07:40:00Z", "text": "Inbound mail queue is growing. Collaboration Services is investigating."},
+        {"at": "{TODAY-4}T11:50:00Z", "text": "Resolved: the mail filtering service was restarted and the queue has drained."}
+      ]
+    }
+  ]
+}
