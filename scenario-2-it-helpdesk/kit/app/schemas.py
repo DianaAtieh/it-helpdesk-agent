@@ -39,6 +39,7 @@ class ApproveRequest(BaseModel):
 
 class ResetRequest(BaseModel):
     session_id: SessionId | None = None     # None = reset every session (needs the admin token)
+    user: User | None = None                # a linked conversation needs its employee's email (or the admin token)
 
 
 # ---------------------------------------------------------------- response

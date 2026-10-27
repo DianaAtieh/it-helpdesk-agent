@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from app.main import get_session
 from app.tickets import TicketDraftError
-from tests.helpers import approve, arm_fault, created_tickets, make_draft, propose, requires_api
+from tests.helpers import approve, arm_fault, created_tickets, ensure_token, make_draft, propose, requires_api
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -48,6 +48,7 @@ def test_reject_writes_nothing(client):
 def test_unknown_or_foreign_action_writes_nothing(client):
     action = propose(client, "s-1", make_draft())
 
+    ensure_token(client, "s-2")                                             # s-2's own, valid token
     assert approve(client, "s-2", action.action_id)["result"] is None      # another session
     assert approve(client, "s-1", "act-made-up")["result"] is None          # invented id
     assert created_tickets() == []

@@ -2,7 +2,10 @@
 
 It never talks to the helpdesk API or the LLM directly. It only calls your app:
     POST {APP_URL}/api/chat      {"session_id", "message", "user": {"email"}}
-    POST {APP_URL}/api/approve   {"session_id", "action_id", "approved"}
+    POST {APP_URL}/api/approve   {"session_id", "action_id", "approved"}  + header X-Session-Token
+The app sends a session token (X-Session-Token response header) on the first chat turn of a conversation;
+approving or rejecting needs it back. It is kept in this tab's server-side state, next to the session id it
+belongs to, and never shown, logged or put in a URL. A page refresh starts a new conversation (and token).
 Run your app first (port 8000), then:   python ui/app_ui.py   ->  http://localhost:7860
 Replace it with your own UI if you like; keep the contract.
 """
@@ -75,18 +78,24 @@ HEADER = f"""
 """
 
 
-def call_app(path: str, body: dict) -> dict:
+def call_app(path: str, body: dict, token: str | None = None) -> tuple[dict, str | None]:
+    """POST to our app. Returns the JSON answer and the session token the app issued in this answer, if any.
+
+    No cookie jar on purpose: one Gradio server serves every browser tab, so a shared jar could mix the
+    tokens of different users. Each tab sends its own token as a header instead.
+    """
+    headers = {"X-Session-Token": token} if token else {}
     try:
-        r = httpx.post(f"{APP_URL}{path}", json=body, timeout=180)
+        r = httpx.post(f"{APP_URL}{path}", json=body, headers=headers, timeout=180)
     except httpx.HTTPError as exc:
-        return {"reply": f"Cannot reach your app at {APP_URL} ({exc.__class__.__name__}). Is it running?"}
+        return {"reply": f"Cannot reach your app at {APP_URL} ({exc.__class__.__name__}). Is it running?"}, None
     try:
         data = r.json()
     except ValueError:
         data = {"reply": r.text[:500]}
-    if r.status_code >= 400:
+    if r.status_code >= 400 and not (isinstance(data, dict) and data.get("reply")):
         data = {"reply": f"Your app answered HTTP {r.status_code}: {str(data)[:400]}"}
-    return data if isinstance(data, dict) else {"reply": str(data)}
+    return (data if isinstance(data, dict) else {"reply": str(data)}), r.headers.get("X-Session-Token")
 
 
 def side_panels(data: dict) -> tuple[str, str, str]:
@@ -133,28 +142,34 @@ def show(data: dict, history: list):
     return history, pending, ticket_card(pending), buttons, buttons, cite_md, tools_md, result_md
 
 
-def send(message: str, history: list, session_id: str, email: str):
+def send(message: str, history: list, session_id: str, email: str, auth: dict | None):
     if not message.strip():
-        return ("", history, *[gr.skip()] * 7)
+        return ("", history, *[gr.skip()] * 7, gr.skip())
     body = {"session_id": session_id, "message": message}
     if email.strip():
         body["user"] = {"email": email.strip().lower()}
     history = history + [{"role": "user", "content": message}]
-    return ("", *show(call_app("/api/chat", body), history))
+    data, issued = call_app("/api/chat", body)
+    if issued:                                         # only the first turn of a conversation issues one
+        auth = {"session_id": session_id, "token": issued}
+    return ("", *show(data, history), auth)
 
 
-def decide(approved: bool, history: list, session_id: str, pending: dict | None):
+def decide(approved: bool, history: list, session_id: str, pending: dict | None, auth: dict | None):
     if not pending:
         return show({"reply": "There is no draft to approve or reject."}, history)
     history = history + [{"role": "user", "content": "Approve" if approved else "Reject"}]
-    data = call_app("/api/approve", {"session_id": session_id, "action_id": pending.get("action_id"),
-                                     "approved": approved})
+    # Only ever the token issued for THIS tab's session id.
+    token = auth["token"] if auth and auth.get("session_id") == session_id else None
+    data, _ = call_app("/api/approve", {"session_id": session_id, "action_id": pending.get("action_id"),
+                                        "approved": approved}, token)
     return show(data, history)
 
 
 with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
-    session = gr.State(lambda: f"ui-{uuid.uuid4().hex[:10]}")
+    session = gr.State(lambda: f"ui-{uuid.uuid4().hex}")  # 128 random bits: the id is all that proves the session
     pending_state = gr.State(None)
+    auth_state = gr.State(None)       # {"session_id", "token"}: per tab, server-side, never sent to the browser
     gr.HTML(HEADER)
     with gr.Row():
         with gr.Column(scale=3):
@@ -172,9 +187,9 @@ with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
             cites = gr.Markdown("### Sources\n_No answer yet._", padding=True, elem_classes="palm-panel")
             tools = gr.Markdown("### Tool calls (last turn)\n_none_", padding=True, elem_classes="palm-panel")
     outputs = [chat, pending_state, card, approve_btn, reject_btn, cites, tools, result]
-    msg.submit(send, [msg, chat, session, email], [msg, *outputs])
-    approve_btn.click(lambda h, s, p: decide(True, h, s, p), [chat, session, pending_state], outputs)
-    reject_btn.click(lambda h, s, p: decide(False, h, s, p), [chat, session, pending_state], outputs)
+    msg.submit(send, [msg, chat, session, email, auth_state], [msg, *outputs, auth_state])
+    approve_btn.click(lambda h, s, p, a: decide(True, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
+    reject_btn.click(lambda h, s, p, a: decide(False, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
 
 if __name__ == "__main__":
     demo.launch(server_port=int(os.getenv("UI_PORT", "7860")), theme=THEME, css=CSS)
