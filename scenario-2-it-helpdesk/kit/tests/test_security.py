@@ -15,7 +15,7 @@ import app.main as main
 from app.main import app, get_session, sessions
 from app.mcp_client import server_env
 from app.schemas import MAX_MESSAGE_CHARS
-from tests.helpers import arm_fault, created_tickets, make_draft, propose, requires_api, token_headers
+from tests.helpers import TURN_RAN, arm_fault, created_tickets, make_draft, propose, requires_api, token_headers
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -138,8 +138,8 @@ def test_a_linked_session_cannot_be_continued_without_the_email(client):
 
 def test_an_anonymous_session_can_keep_talking_without_an_email(client):
     # Sessions that never named an employee (sample case S2-02) are not affected.
-    assert chat(client).json()["state"] == "skeleton"
-    assert chat(client).json()["state"] == "skeleton"
+    assert chat(client).json()["state"] in TURN_RAN
+    assert chat(client).json()["state"] in TURN_RAN
 
 
 # ------------------------------------------------------------- 5. the session store is bounded

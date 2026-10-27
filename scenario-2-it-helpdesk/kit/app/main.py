@@ -3,8 +3,8 @@
     uvicorn app.main:app --port 8000 --reload
 
 Endpoints follow common/CONTRACT.md. /api/chat runs the LangGraph agent (app/agent/), whose
-conversation memory is saved in SQLite per session_id. Phase 1: the graph has one node that checks
-the real status page through MCP (UI -> our API -> graph -> MCP -> helpdesk API -> reply).
+conversation memory is saved in SQLite per session_id. Phase 2: triage (directory + status page over MCP),
+then either a verified incident or a grounded answer from the knowledge base (app/agent/graph.py).
 
 The helpdesk API must be running on port 8102 (uvicorn services.helpdesk_api:app --port 8102).
 """
@@ -36,11 +36,13 @@ load_dotenv(KIT / ".env", override=False)
 
 from app.agent.graph import FINAL_NODE, build_graph  # noqa: E402  (after load_dotenv on purpose)
 from app.agent.nodes import describe_status  # noqa: E402,F401  (re-exported: it used to live here)
+from app.agent.retrieval import KnowledgeBaseError, load_knowledge_base  # noqa: E402
 from app.agent.storage import delete_expired_threads, prune_thread, retention_days, trim_history  # noqa: E402
 from app.guardrails import WITHHELD, looks_like_instructions, redact_secrets  # noqa: E402
+from app.llm import LLMError, OpenRouterChat  # noqa: E402
 from app.mcp_client import HelpdeskMCP  # noqa: E402
-from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, PendingAction, ResetRequest,  # noqa: E402
-                         ToolCall)
+from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, Citation, PendingAction,  # noqa: E402
+                         ResetRequest, ToolCall)
 from app.tickets import ROUTING, TICKET_ID, TicketDraft, propose_ticket  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -71,12 +73,25 @@ def checkpoint_db_path() -> Path:
 async def lifespan(app: FastAPI):
     # The SQLite checkpointer (conversation memory for the LangGraph agent) and the MCP server both live
     # exactly as long as the app. The saver binds to this event loop, so it must be created here.
+    # The knowledge base and the chat model are built once here and injected into the graph. If either
+    # cannot be built (no index, no key, no MODEL), the app still starts and answers honestly that it
+    # cannot search or answer right now.
     db_path = checkpoint_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        app.state.kb = load_knowledge_base()
+    except KnowledgeBaseError as exc:
+        log.warning("knowledge base unavailable (%s): chat answers will say so", exc.code)
+        app.state.kb = None
+    try:
+        app.state.llm = OpenRouterChat.from_env()
+    except LLMError as exc:
+        log.warning("chat model unavailable (%s): chat answers will say so", exc.code)
+        app.state.llm = None
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
-        app.state.graph = build_graph(checkpointer, mcp)
+        app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm)
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
                  db_path, expired, retention_days())
@@ -455,11 +470,15 @@ async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResp
     if new_token:
         session.update(token_fields)
         send_session_token(response, req.session_id, new_token)
+    # The graph's outcome maps onto the contract's existing fields: state (answered | clarify | incident |
+    # not_documented | error), citations (only documents in this turn's evidence, checked by respond) and usage.
     return ChatResponse(
         session_id=req.session_id,
         reply=f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"],
-        state="skeleton",
+        state=out.get("outcome") or "error",
+        citations=[Citation(id=c["id"], title=c.get("title") or "") for c in out.get("citations") or []],
         tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])],
+        usage=out.get("usage") or None,
     )
 
 

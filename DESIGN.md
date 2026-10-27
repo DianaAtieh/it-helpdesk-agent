@@ -55,13 +55,14 @@ flowchart LR
 - **HTTP is the graded path:** the contract, the eval runner, the hidden tests and the Gradio starter all use `/api/chat` and `/api/approve`. `WS /ws/chat` streams the same agent's reply and events (`token`, `tool_call`, `pending_action`, `done`, `error`) and must end in the same ChatResponse. Approval always goes through `POST /api/approve`, never over the socket.
 - **`POST /reset`** clears **our** app's session state (one session or all); it never touches the knowledge base index and is separate from the helpdesk API's test-only `/admin/reset`.
 - **Session token (who may approve).** A `session_id` names a conversation but proves nothing, and an email is only a claim. So the first `/api/chat` turn of a **new** conversation issues a random token (256 bits), sent as the `X-Session-Token` response header **and** an HttpOnly, SameSite=Strict cookie (`Secure` when `SESSION_COOKIE_SECURE=true`, i.e. behind HTTPS). The server stores only its SHA-256, in the checkpoint, so it survives restarts. `/api/approve` (approve **and** reject) needs it back, as the header or the cookie (the header wins); otherwise it answers **403** with `state: "unauthorized"`, changes nothing and never calls `create_ticket`. A token is never issued twice for one conversation. It is never in a URL, a response body or a log.
-  - **The course JSON contract is unchanged.** Clients that keep cookies need no change: `evals/run_evals.py` uses one `httpx.Client`, so the cookie from `/api/chat` goes back with `/api/approve` by itself. A client that keeps no cookies must forward the header. *Open question for the trainers: does the hidden test runner keep cookies like `run_evals.py`?*
+  - **The course JSON contract is unchanged.** Clients that keep cookies need no change: `evals/run_evals.py` uses one `httpx.Client`, so the cookie from `/api/chat` goes back with `/api/approve` by itself. A client that keeps no cookies must forward the header. The rubric says the hidden tests run with `run_evals.py`, so they keep the cookie too.
   - **The Gradio UI** keeps the token in per-tab, server-side `gr.State`, next to the session id it belongs to, and sends it as a header (no shared cookie jar, so tabs and users never mix). A page refresh starts a new conversation and a new token; a draft from before the refresh can no longer be approved (it fails safely: ask again).
   - **Expiry:** a token may approve for `SESSION_TOKEN_TTL_SECONDS` (default 24 h) after it was issued. After that the reply says so; **the employee starts a new conversation and asks for the ticket again.** An expired token still proves ownership for `/reset`.
   - **`/reset` of one conversation** needs its token or the admin token (an email is no longer enough). Conversations saved before tokens existed keep the older rule (their linked email, or the admin token), and can never approve.
 - **Offline ingestion** (one command, re-runnable): 20 docs (18 MD + 2 PDF) → loader → section-aware chunker (both done on `feature/offline-rag`) → OpenRouter embeddings → SQLite.
 - **Deployment:** on EC2 only the UI (or a proxy on 80/443) is public; port 8102 stays internal because its `/admin/*` endpoints have no key. SQLite lives on a Docker volume so it survives restarts.
 - The final diagram goes in the README; the editable starting point is `visuals/editable/s2-architecture.drawio`.
+- **What is built today** (the graph, retrieval, the answer rules and the protections) is described in **section 10**. This sketch is the target design.
 
 ## 3. Roles (at least two, with different jobs)
 
@@ -130,6 +131,83 @@ The full list grows to 15+ in `evals/cases.jsonl` (the 10 samples + our own).
 - **Most likely to eat the week:** retrieval + precedence getting the *right* document (error codes blur in embeddings, so we add exact error-code matching using the chunks' `error_codes` field), and debugging eval failures.
 - **Integration risk:** two people building in parallel. We agree on the retrieval interface early, `search(query, k) -> list[(Chunk, score)]`, and work in separate folders (`ingestion/` vs `app/`).
 - **Cut first if late, in this order:** AWS EC2 deployment → WebSocket streaming → long-term memory beyond ticket history → stretch goals. Never cut: the approval gate, precedence, citations, `docker compose up`, the 10+ eval cases.
+
+## 10. What is built so far (Phase 2) and what is not yet
+
+*Status: 2026-10-28, branch `feature/agent-phase2`. Sections 2–9 are the target design; this section describes the code as it is. If the two disagree, this section is the current truth.*
+
+### The graph (`app/agent/graph.py`)
+
+```
+START → triage ─┬─ a verified active incident ──────────────┐
+                └─ otherwise → retrieve → answer ───────────┴→ respond → END      FINAL_NODE = "respond"
+```
+
+| Node | What it does | Model? |
+|---|---|---|
+| **triage** (`nodes.make_triage`) | Looks up the conversation's locked email with `lookup_employee` (cached only for that same email); the department comes **only** from the directory, never from the message. Reads the status page with `get_service_status`: the **only** status call of a turn. Extracts error codes (strict form, e.g. `NX-781`, `CRM-1150`). Routes to the incident branch only if an **active** incident lists one of the user's codes (loose forms such as "nx 503" are accepted only for this match). If the status page fails, it records the failure and routes to retrieve; it never concludes "no incident". | No |
+| **incident** (in `respond`) | A reply built only from the status page: the incident ID, its workaround and its instructions ("do not open individual tickets"). No citations. Sample case S2-09. | No |
+| **retrieve** (`nodes.make_retrieve`) | Searches the knowledge base through `app/agent/retrieval.py`, a thin wrapper around ingestion's `PolicyRetriever`, **unchanged**. Built once at startup and searched in a worker thread. Uses only `for_answering()` evidence (actionable and conditional chunks) plus current, authoritative rule-lane chunks: deprecated, draft, superseded and context-only documents never reach the answer. Scoped to the directory department. After a clarifying question, the original problem and the answer are searched together. A code that no evidence mentions is marked **undocumented** (this covers the retriever's CRM-1150 gap in the agent; `ingestion/` is not changed). Live query embeddings: 2 attempts, 10 s timeout. | No (one embedding call) |
+| **answer** (`nodes.make_answer`) | One chat-model call through `app/llm.py` (OpenRouter, `MODEL`, JSON out, **no tools**, 30 s timeout, 1 retry). The prompt (`app/agent/prompts.py`) keeps our rules in the system prompt and puts the message, the history and the evidence in **one JSON object** marked as untrusted data. The model is not told about incidents. Citations are kept only if they name documents in this turn's evidence. | Yes |
+| **respond** (`nodes.make_respond`) | The last check on everything that leaves the agent (see below). | No |
+
+**Deterministic replies (no model call):**
+
+- Knowledge base unavailable or search failed: "I couldn't search the IT knowledge base right now…"
+- Unknown employee **and** no error code: ask for the exact error code and the work email (S2-02).
+- Every code in the question undocumented: "no documented fix for CRM-1150… I can escalate it to IT as a ticket" (S2-04).
+- No evidence: ask one question.
+- Model failure, timeout or unusable output: "Sorry, I couldn't prepare an answer right now."
+
+**Clarifications (allowlist).** A question written by the model is shown only if every sentence is a question that opens like a request for information ("What…", "Which…", "Could you tell me…") and asks for one of: **error code or message, work email, department, app, operating system, version**. Nothing that hints at a step, a setting, a credential or a bypass, and no digits. Anything else gets our own fixed question. Clarifications carry no citations.
+
+**The respond node:**
+
+- Citations: only documents in **this turn's** evidence. An "answered" reply left with no valid citation is replaced by an honest "no documented steps; tell me the exact code, or I can escalate it".
+- `redact_secrets` on every reply.
+- `IT-` ticket IDs are replaced by "[ticket ID removed]".
+- Sentences that falsely claim an action are removed: a ticket created, an issue already escalated, forwarded, reported, notified or assigned, or an unconditional "a technician will contact you". Curly apostrophes are normalised before checking. A conditional is kept only if the sentence starts with if, once, after or when and is about the ticket process ("Once a ticket is filed, Security Operations will contact you").
+- The reply is never empty and at most 2000 characters.
+
+### `/api/chat` (the course contract is unchanged)
+
+- `state`: `answered`, `clarify`, `incident`, `not_documented` or `error`. The earlier `identity_mismatch` and `busy` remain.
+- `citations`: `[{id, title, url: null}]`.
+- `tool_calls`: `lookup_employee`, `get_service_status` and `search_knowledge_base`, with `ok` and `ms`.
+- `usage`: the chat model's token counts.
+- If the knowledge base or the chat model cannot be built at startup (no index, no key, no `MODEL`), the app still starts and replies honestly that it cannot search or answer.
+
+### Security protections in place
+
+- **No ticket writing by the model:** the model gets no tools; a test checks that no agent file contains `create_ticket` or `add_ticket_note`. Tickets are written only in `/api/approve`, behind the session token (section 2).
+- **Identity:** a linked conversation must send the same email on every turn; the department and VIP flag come from the directory; an anonymous conversation's history is cleared before an email is linked.
+- **Untrusted text:** retrieved documents and the history go to the model as quoted JSON data; instruction-like employee messages are answered once, then withheld from later turns; the history holds at most 40 messages.
+- **Secrets:** redacted before the graph runs and again on every reply.
+- **Grounding:** citations are checked against this turn's evidence; the clarification allowlist; false-action claims are removed.
+- **Sessions:** one request per session at a time, with wait and queue limits; logs show a hashed session reference.
+
+### Verified
+
+- **App tests:** the full suite with fakes for the model and the knowledge base (`pytest tests`): **415 passed, 2 skipped, 1 xfailed** (the 2 skips are the opt-in real-model tests, the xfail is the retriever's known CRM-1150 gap). After the final hardening (the clarification allowlist and the narrower claim checks), the focused tests (213 passed) and the API tests (11 passed) were run; the full suite was not re-run after that. The opt-in real end-to-end test (`RUN_REAL_LLM=1 pytest tests/test_e2e_real.py`) passed 2/2 with the real model.
+- **Evals with the real model** (`run_evals.py --judge`, output kept out of `evals/scorecard.*`):
+  - S2-01, S2-02, S2-03, S2-04, S2-08 and S2-09 passed 3/3 each (18/18), so the full set is **6/10**.
+  - S2-05, S2-06, S2-07 and S2-10 fail because no chat turn creates a ticket draft yet (Phase 4).
+  - After the later hardening (clarification and claim checks, live-embedding limits), S2-02 and S2-08 were re-run: 6/6. The final allowlist and claim refinements were checked with unit and API tests, not with a new real-model run.
+
+### Known limitations
+
+- The claim, clarification and redaction checks are pattern-based. Unlisted wordings ("I've raised this with IT", "IT is now aware") can pass, and a bare credential without "is", "=" or ":" is not redacted.
+- Security policy over KB article is applied by the **prompt** only. A citation can name a document that does not actually support the sentence.
+- Incident symptoms without the incident's code are not linked to the incident.
+- An anonymous employee with no error code is always asked for the error code and the work email first.
+- An email is a claim, not proof: someone can name a colleague's email and get that department's guidance.
+
+### Deferred
+
+- **Phase 3, verifier:** security policy over KB article in code; check that each cited chunk supports what the reply says.
+- **Phase 4, escalation:** ticket drafts from chat through `propose_draft` and `/api/approve` (S2-05, S2-06, S2-07, S2-10); priority by the KB's rules (VIP, many users); attempted steps. The email-is-a-claim limit matters here, because VIP means P1.
+- **Later in the plan:** persistent memory (section 5), our own 10+ eval cases and the README scorecard, a separate input guard for forbidden requests (section 6; today, policy refusals rely on prompt rule 6 and the SP- evidence), and WebSocket streaming.
+- **Deployment blockers, before any public exposure:** a rate limit and a daily budget cap on the paid model and embedding calls; the app's Docker image with the checkpoint database on a volume.
 
 ---
 

@@ -18,7 +18,7 @@ from langchain_core.messages import HumanMessage
 
 from app import main
 from app.main import CLAIM_NOTE, app, sessions, thread_config
-from tests.helpers import approve, created_tickets, make_draft, propose, requires_api
+from tests.helpers import TURN_RAN, approve, created_tickets, make_draft, propose, requires_api
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -60,7 +60,7 @@ def test_1_an_email_after_anonymous_turns_links_the_session_and_drops_the_earlie
     chat(client, "s-1", "My VPN is not working. Can you fix it?")
     out = chat(client, "s-1", "It shows NX-112", SARA)
 
-    assert out["state"] == "skeleton" and out["reply"].startswith(CLAIM_NOTE)
+    assert out["state"] in TURN_RAN and out["reply"].startswith(CLAIM_NOTE)
     assert human_messages(client, "s-1") == ["It shows NX-112"]             # only the turn after the email
     assert saved(client, "s-1")["user_email"] == SARA["email"]
 
@@ -83,7 +83,7 @@ def test_4_after_the_claim_the_same_employee_continues_normally(client):
     chat(client, "s-1", "now with my email", SARA)
     out = chat(client, "s-1", "and again", SARA)
 
-    assert out["state"] == "skeleton" and CLAIM_NOTE not in out["reply"]
+    assert out["state"] in TURN_RAN and CLAIM_NOTE not in out["reply"]
     assert human_messages(client, "s-1") == ["now with my email", "and again"]
 
 
@@ -152,7 +152,7 @@ def test_10_the_link_made_by_a_claim_survives_a_restart(client):
 
     assert chat(client, "s-1", "it is me, Sara", SARA)["state"] == "identity_mismatch"
     out = chat(client, "s-1", "still me", SAMIR)
-    assert out["state"] == "skeleton" and CLAIM_NOTE not in out["reply"]      # nothing left to clear
+    assert out["state"] in TURN_RAN and CLAIM_NOTE not in out["reply"]      # nothing left to clear
     assert human_messages(client, "s-1") == ["hello", "still me"]
 
 
@@ -177,7 +177,7 @@ def test_11_if_clearing_fails_the_email_is_not_linked_and_nothing_runs(client, m
 
     monkeypatch.undo()                                                       # the database works again
     retried = chat(client, "s-1", "hello again", SAMIR)
-    assert retried["state"] == "skeleton"
+    assert retried["state"] in TURN_RAN
     assert human_messages(client, "s-1") == ["hello again"]
     assert b"ZX-PRIVATE-7781" not in raw_database(client)
 

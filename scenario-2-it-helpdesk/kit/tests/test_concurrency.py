@@ -20,8 +20,8 @@ from langchain_core.messages import HumanMessage
 
 import app.main as main
 from app.main import app, get_session, sessions, thread_config
-from tests.helpers import (approve, arm_fault, created_tickets, ensure_token, make_draft, propose, requires_api,
-                           token_headers)
+from tests.helpers import (TURN_RAN, approve, arm_fault, created_tickets, ensure_token, make_draft, propose,
+                           requires_api, token_headers)
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -59,7 +59,7 @@ def test_two_chats_on_one_session_at_once_both_run_and_both_are_saved(client):
     (s1, first), (s2, second) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                          (0.3, "/api/chat", chat_body("s-1", "second")))
     assert (s1, s2) == (200, 200)
-    assert first["state"] == second["state"] == "skeleton"
+    assert {first["state"], second["state"]} <= TURN_RAN
     assert human_messages(client, "s-1") == ["first", "second"]             # in order, no lost update
 
 
@@ -67,7 +67,7 @@ def test_two_sessions_at_once_do_not_block_each_other(client):
     arm_fault("status", "slow")
     (_, a), (_, b) = together(client, (0, "/api/chat", chat_body("s-a", "from A")),
                               (0.3, "/api/chat", chat_body("s-b", "from B")))
-    assert a["state"] == b["state"] == "skeleton"                           # neither was refused as busy
+    assert {a["state"], b["state"]} <= TURN_RAN                           # neither was refused as busy
     assert human_messages(client, "s-a") == ["from A"] and human_messages(client, "s-b") == ["from B"]
 
 
@@ -78,7 +78,7 @@ def test_a_request_that_waits_too_long_is_told_to_retry_and_changes_nothing(clie
     arm_fault("status", "slow")
     (_, first), (_, second) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                        (0.3, "/api/chat", chat_body("s-1", "second")))
-    assert first["state"] == "skeleton"
+    assert first["state"] in TURN_RAN
     assert second["state"] == "busy" and second["tool_calls"] == [] and "again" in second["reply"]
     assert human_messages(client, "s-1") == ["first"]                       # the refused message was not run
 
@@ -89,7 +89,8 @@ def test_only_a_limited_number_of_requests_may_wait_for_one_session(client, monk
     results = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                        (0.3, "/api/chat", chat_body("s-1", "second")),      # waits
                        (0.6, "/api/chat", chat_body("s-1", "third")))       # one too many: refused at once
-    assert [out["state"] for _, out in results] == ["skeleton", "skeleton", "busy"]
+    states = [out["state"] for _, out in results]
+    assert set(states[:2]) <= TURN_RAN and states[2] == "busy"
     assert human_messages(client, "s-1") == ["first", "second"]
     assert sessions["s-1"]["waiting"] == 0 and not sessions["s-1"]["lock"].locked()
 
@@ -138,7 +139,7 @@ def test_a_chat_during_an_approval_waits_and_both_are_saved(client):
         (0.3, "/api/chat", chat_body("s-1", human)))
 
     ticket_id = approved["result"]["ticket_id"]
-    assert chat_out["state"] == "skeleton"
+    assert chat_out["state"] in TURN_RAN
     assert human_messages(client, "s-1") == [human]
     values = client.portal.call(app.state.graph.aget_state, thread_config("s-1")).values
     assert values["filed"] == {action.action_id: ticket_id} and values["pending_action"] is None
@@ -150,7 +151,7 @@ def test_a_reset_during_a_chat_waits_for_it_and_the_conversation_does_not_come_b
     arm_fault("status", "slow")
     (_, out), (status, reset) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                          (0.3, "/reset", {"session_id": "s-1", "user": SARA}))
-    assert out["state"] == "skeleton"
+    assert out["state"] in TURN_RAN
     assert status == 200 and reset["reset"] == "s-1"
     assert human_messages(client, "s-1") == []                              # deleted after the turn saved
     assert "s-1" not in sessions
@@ -162,5 +163,5 @@ def test_a_reset_that_waits_too_long_is_refused_and_deletes_nothing(client, monk
     arm_fault("status", "slow")
     (_, out), (status, _) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                      (0.3, "/reset", {"session_id": "s-1", "user": SARA}))
-    assert out["state"] == "skeleton" and status == 409
+    assert out["state"] in TURN_RAN and status == 409
     assert human_messages(client, "s-1") == ["first"]
