@@ -30,3 +30,5 @@ langgraph==1.2.10
 openai==2.52.0
 # Tests
 pytest==8.4.2
+langgraph-checkpoint-sqlite==3.1.2
+
