@@ -11,8 +11,10 @@ __pycache__/
 *.pem
 *.key
 
-# Local databases
+# Local databases (SQLite in WAL mode also writes -wal and -shm files next to the .db)
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 

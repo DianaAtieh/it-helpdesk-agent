@@ -20,9 +20,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+KIT = Path(__file__).resolve().parent.parent
 
 # The kit's .env, without overriding variables that are already set (e.g. by Docker).
-load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+load_dotenv(KIT / ".env", override=False)
 
 from app.mcp_client import HelpdeskMCP  # noqa: E402  (after load_dotenv on purpose)
 from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest  # noqa: E402
@@ -32,18 +35,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("helpdesk-app")
 
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS") or 1000)
+DEFAULT_CHECKPOINT_DB = KIT / "app" / "data" / "checkpoints.db"
 
 mcp = HelpdeskMCP()
 
 
+def checkpoint_db_path() -> Path:
+    """CHECKPOINT_DB, read when the app starts (so tests can point it elsewhere). Relative paths are under the kit."""
+    path = Path(os.getenv("CHECKPOINT_DB") or DEFAULT_CHECKPOINT_DB)
+    return path if path.is_absolute() else KIT / path
+
+
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    # Start the MCP server once with the app, and stop it when the app stops.
-    await mcp.start()
-    try:
-        yield
-    finally:
-        await mcp.stop()
+async def lifespan(app: FastAPI):
+    # The SQLite checkpointer (conversation memory for the LangGraph agent) and the MCP server both live
+    # exactly as long as the app. The saver binds to this event loop, so it must be created here.
+    db_path = checkpoint_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        await checkpointer.setup()
+        app.state.checkpointer = checkpointer
+        log.info("checkpointer ready: %s", db_path)
+        await mcp.start()
+        try:
+            yield
+        finally:
+            await mcp.stop()
+            app.state.checkpointer = None
 
 
 app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifespan)
