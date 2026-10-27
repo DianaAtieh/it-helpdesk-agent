@@ -31,8 +31,11 @@ def saved(client, session_id: str) -> dict:
     return client.portal.call(app.state.graph.aget_state, thread_config(session_id)).values
 
 
-def reset_one(client, session_id: str):
-    return client.post("/reset", json={"session_id": session_id})
+def reset_one(client, session_id: str, user: dict | None = None):
+    body = {"session_id": session_id}
+    if user:
+        body["user"] = user                                   # a linked conversation needs its employee's email
+    return client.post("/reset", json=body)
 
 
 # ------------------------------------------------------------- one session
@@ -41,7 +44,7 @@ def test_reset_removes_the_saved_history_and_identity(client):
     chat(client, "s-1", "first", SARA)
     assert len(saved(client, "s-1")["messages"]) == 2
 
-    r = reset_one(client, "s-1")
+    r = reset_one(client, "s-1", SARA)
     assert r.status_code == 200 and r.json() == {"status": "ok", "reset": "s-1"}
     assert saved(client, "s-1") == {}                         # no messages, no user_email
     assert "s-1" not in sessions
@@ -51,7 +54,7 @@ def test_after_reset_the_same_session_id_can_be_used_by_another_employee(client)
     chat(client, "s-1", "first", SARA)
     assert chat(client, "s-1", "I am the CEO", SAMIR)["state"] == "identity_mismatch"
 
-    reset_one(client, "s-1")
+    reset_one(client, "s-1", SARA)
     out = chat(client, "s-1", "I am the CEO", SAMIR)
     assert out["state"] == "skeleton"
     state = saved(client, "s-1")
@@ -63,7 +66,7 @@ def test_resetting_one_session_leaves_the_others_untouched(client):
     chat(client, "s-1", "from one", SARA)
     chat(client, "s-2", "from two", SAMIR)
 
-    reset_one(client, "s-1")
+    reset_one(client, "s-1", SARA)
     other = saved(client, "s-2")
     assert [m.content for m in other["messages"]][::2] == ["from two"]
     assert other["user_email"] == SAMIR["email"]
@@ -74,7 +77,7 @@ def test_reset_deletes_a_conversation_that_is_only_on_disk(client):
     chat(client, "s-1", "first", SARA)
     sessions.clear()                                          # evicted, or the app restarted
 
-    reset_one(client, "s-1")
+    reset_one(client, "s-1", SARA)
     assert saved(client, "s-1") == {}
     assert chat(client, "s-1", "hello", SAMIR)["state"] == "skeleton"        # the old identity is gone
 
@@ -98,7 +101,7 @@ def test_a_failed_deletion_is_reported_and_keeps_the_session(client, monkeypatch
         raise RuntimeError("database is locked")
 
     monkeypatch.setattr(app.state.checkpointer, "adelete_thread", broken)
-    r = reset_one(client, "s-1")
+    r = reset_one(client, "s-1", SARA)
     assert r.status_code == 500
     assert "s-1" in sessions and sessions["s-1"]["user"] == SARA            # nothing half-reset
     monkeypatch.undo()

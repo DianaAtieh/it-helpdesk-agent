@@ -11,28 +11,34 @@ The helpdesk API must be running on port 8102 (uvicorn services.helpdesk_api:app
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import secrets
+import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 KIT = Path(__file__).resolve().parent.parent
 
 # The kit's .env, without overriding variables that are already set (e.g. by Docker).
 load_dotenv(KIT / ".env", override=False)
 
-from app.agent.graph import build_graph  # noqa: E402  (after load_dotenv on purpose)
+from app.agent.graph import FINAL_NODE, build_graph  # noqa: E402  (after load_dotenv on purpose)
 from app.agent.nodes import describe_status  # noqa: E402,F401  (re-exported: it used to live here)
+from app.agent.storage import delete_expired_threads, prune_thread, retention_days, trim_history  # noqa: E402
+from app.guardrails import WITHHELD, looks_like_instructions, redact_secrets  # noqa: E402
 from app.mcp_client import HelpdeskMCP  # noqa: E402
-from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest, ToolCall  # noqa: E402
-from app.tickets import ROUTING, TICKET_ID  # noqa: E402
+from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, PendingAction, ResetRequest,  # noqa: E402
+                         ToolCall)
+from app.tickets import ROUTING, TICKET_ID, TicketDraft, propose_ticket  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("helpdesk-app")
@@ -41,6 +47,15 @@ MAX_SESSIONS = int(os.getenv("MAX_SESSIONS") or 1000)
 DEFAULT_CHECKPOINT_DB = KIT / "app" / "data" / "checkpoints.db"
 
 mcp = HelpdeskMCP()
+
+# A session id is all it takes to continue a conversation, so the logs never show it: they show a keyed
+# hash instead. The key is new on every start, so a reference is stable only while the app runs.
+_LOG_KEY = secrets.token_bytes(16)
+
+
+def session_ref(session_id: str) -> str:
+    """The session id as it appears in the logs: s#<10 hex characters>, not reversible."""
+    return "s#" + hashlib.blake2b(session_id.encode(), key=_LOG_KEY, digest_size=5).hexdigest()
 
 
 def checkpoint_db_path() -> Path:
@@ -59,7 +74,9 @@ async def lifespan(app: FastAPI):
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
         app.state.graph = build_graph(checkpointer, mcp)
-        log.info("checkpointer ready: %s", db_path)
+        expired = await delete_expired_threads(checkpointer)
+        log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
+                 db_path, expired, retention_days())
         await mcp.start()
         try:
             yield
@@ -71,32 +88,138 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifespan)
 
-# Session state, keyed by session_id:
-#   user            {"email": ...} or None
-#   pending_action  the one PendingAction waiting for approval, or None
-#   filed           {action_id: ticket_id} for approvals that already created a ticket (replay protection)
+# Session state, keyed by session_id: an in-memory cache of what the checkpoint saves, plus the lock.
+#   user            {"email": ...} or None                                (saved as user_email)
+#   pending_action  the one PendingAction waiting for approval, or None   (saved as pending_action)
+#   filed           {action_id: ticket_id} for approvals that already created a ticket (saved as filed)
+#   loaded          True once the saved values were read back from the checkpoint
 #   lock            one request per session at a time, so Approve and Reject cannot race
-# Temporary: the LangGraph SQLite checkpointer replaces this dict later.
+#   waiting         how many requests are waiting for the lock (see session_turn)
 # Least recently used first; at most MAX_SESSIONS are kept, so new session ids cannot fill the memory.
+# An evicted session loses nothing: load_session() reads it back from the checkpoint.
 sessions: OrderedDict[str, dict] = OrderedDict()
+
+
+def lock_wait_seconds() -> float:
+    return float(os.getenv("SESSION_LOCK_WAIT_SECONDS") or 30)
+
+
+def max_waiting_requests() -> int:
+    return int(os.getenv("SESSION_MAX_WAITING") or 2)
+
+
+class SessionBusy(Exception):
+    """The session is busy with another request, and this one may not (or no longer) wait for it."""
+
+
+@asynccontextmanager
+async def session_turn(session: dict):
+    """Hold the session's lock for one request, but never queue without limit (V9).
+
+    One request of a session can hold the lock for a long time (one MCP call may take up to 25 s), so a
+    request waits at most SESSION_LOCK_WAIT_SECONDS, and at most SESSION_MAX_WAITING requests may wait at
+    once. Otherwise SessionBusy is raised and the request did nothing.
+    """
+    if session["lock"].locked() and session["waiting"] >= max_waiting_requests():
+        raise SessionBusy
+    session["waiting"] += 1
+    try:
+        await asyncio.wait_for(session["lock"].acquire(), lock_wait_seconds())
+    except TimeoutError:
+        raise SessionBusy from None
+    finally:
+        session["waiting"] -= 1
+    try:
+        yield
+    finally:
+        session["lock"].release()
 
 
 def get_session(session_id: str) -> dict:
     session = sessions.get(session_id)
     if session is None:
-        session = {"user": None, "pending_action": None, "filed": {}, "lock": asyncio.Lock()}
+        session = {"user": None, "pending_action": None, "filed": {}, "loaded": False, "lock": asyncio.Lock(),
+                   "waiting": 0}
         sessions[session_id] = session
-        _evict_idle_sessions()
+        _evict_idle_sessions(keep=session_id)
     sessions.move_to_end(session_id)
     return session
 
 
-def _evict_idle_sessions() -> None:
-    """Drop the least recently used sessions above MAX_SESSIONS, never one with a request in progress."""
+async def load_session(session_id: str, session: dict) -> None:
+    """Fill a fresh in-memory session from its checkpoint (after a restart or an eviction). Call under the lock."""
+    if session["loaded"]:
+        return
+    saved = (await app.state.graph.aget_state(thread_config(session_id))).values
+    if saved.get("user_email"):
+        session["user"] = {"email": saved["user_email"]}
+    if saved.get("pending_action"):
+        session["pending_action"] = PendingAction(**saved["pending_action"])
+    session["filed"] = dict(saved.get("filed") or {})
+    session["loaded"] = True
+
+
+async def save_approval_state(session_id: str, session: dict) -> None:
+    """Save the draft and the filed record in the checkpoint, so a restart cannot lose or misreport them."""
+    pending = session["pending_action"]
+    await app.state.graph.aupdate_state(thread_config(session_id), {
+        "pending_action": pending.model_dump() if pending else None,   # plain dict: checkpoint-safe
+        "filed": dict(session["filed"]),
+    }, as_node=FINAL_NODE)
+    await prune_thread(app.state.checkpointer, session_id)
+
+
+async def propose_draft(session_id: str, draft: TicketDraft) -> tuple[PendingAction, list[ToolCall]]:
+    """The one way to create a ticket draft: load the session, check the draft (propose_ticket), save it.
+
+    Call it under the session's lock (the agent will, from inside /api/chat). Writes no ticket.
+    Raises TicketDraftError for an invalid draft; nothing is stored then.
+    """
+    session = get_session(session_id)
+    await load_session(session_id, session)
+    action, calls = await propose_ticket(session, draft, mcp)
+    await save_approval_state(session_id, session)
+    return action, calls
+
+
+CLAIM_NOTE = ("For your privacy, I don't carry over anything said in this conversation before you gave your "
+              "email. Please describe your problem again if I need it.")
+
+
+async def clear_anonymous_history(session_id: str, session: dict) -> bool:
+    """Before an anonymous conversation is linked to an email: forget everything said in it. Call under the lock.
+
+    An email is a claim, not proof (anyone who knows the session id can send one), so the employee who links
+    the conversation gets none of its earlier messages, replies or ticket draft. The filed record stays, so a
+    replayed approval is still answered truthfully. Returns True if something was cleared.
+    Raises if the database fails; the caller must then not link the email.
+    """
+    config = thread_config(session_id)
+    saved = (await app.state.graph.aget_state(config)).values
+    cleared = bool(saved.get("messages") or saved.get("pending_action") or session["pending_action"])
+    if cleared:
+        await app.state.graph.aupdate_state(config, {
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
+            "pending_action": None,
+            "reply": None,
+            "active_incident": None,
+            "tool_calls": [],
+            "filed": dict(session["filed"]),
+        }, as_node=FINAL_NODE)
+    # Always: the older checkpoints still hold the history. This also finishes an earlier claim whose
+    # pruning failed after the history was already cleared from the newest checkpoint.
+    await prune_thread(app.state.checkpointer, session_id)
+    session["pending_action"] = None
+    return cleared
+
+
+def _evict_idle_sessions(keep: str) -> None:
+    """Drop the least recently used sessions above MAX_SESSIONS, never one with a request in progress or
+    waiting, and never `keep` (the session just created: evicting it made the request fail with a KeyError)."""
     for session_id in list(sessions):
         if len(sessions) <= MAX_SESSIONS:
             break
-        if not sessions[session_id]["lock"].locked():
+        if session_id != keep and not sessions[session_id]["lock"].locked() and not sessions[session_id]["waiting"]:
             del sessions[session_id]
 
 
@@ -127,53 +250,97 @@ def health() -> dict:
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session = get_session(req.session_id)
-    async with session["lock"]:
-        return await _chat(req, session)
+    try:
+        async with session_turn(session):
+            return await _chat(req, session)
+    except SessionBusy:
+        log.info("chat session=%s busy: an earlier request is still running", session_ref(req.session_id))
+        return ChatResponse(
+            session_id=req.session_id,
+            reply=("I'm still working on an earlier message in this conversation, so I did not read this one. "
+                   "Please send it again in a moment."),
+            state="busy",
+        )
+
+
+def agent_error_reply(session_id: str) -> ChatResponse:
+    return ChatResponse(
+        session_id=session_id,
+        reply="Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
+        state="error",
+    )
 
 
 async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
     graph = app.state.graph
     config = thread_config(req.session_id)
 
-    # The saved conversation outlives the in-memory session (evicted, or the app restarted): take the
-    # email back from the checkpoint, so the identity lock below still holds for this conversation.
-    if session["user"] is None:
-        saved_email = (await graph.aget_state(config)).values.get("user_email")
-        if saved_email:
-            session["user"] = {"email": saved_email}
+    # The saved conversation outlives the in-memory session (evicted, or the app restarted): read the
+    # email, the draft and the filed record back, so the identity lock and the gate still hold.
+    try:
+        await load_session(req.session_id, session)
+    except Exception:  # the checkpoint database failed: reply honestly, never a 500
+        log.exception("chat session=%s: could not load the saved conversation", session_ref(req.session_id))
+        return agent_error_reply(req.session_id)
 
-    # Without a login the email is a claim, but a conversation cannot switch to another employee
-    # (e.g. to a VIP for a P1 ticket) once it started.
+    # Without a login the email is a claim, but once a conversation is linked to an employee, every turn
+    # must name that same employee: a different email (e.g. a VIP for a P1 ticket) or NO email (someone who
+    # only knows the session id) cannot continue it.
     current = (session["user"] or {}).get("email")
-    if req.user and current and req.user.email != current:
-        log.warning("chat session=%s refused: user changed from %s to %s", req.session_id, current, req.user.email)
+    if current and (req.user is None or req.user.email != current):
+        log.warning("chat session=%s refused: linked to %s, request names %s", session_ref(req.session_id), current,
+                    req.user.email if req.user else "no user")
         return ChatResponse(
             session_id=req.session_id,
-            reply="This conversation is already linked to another employee. Please start a new conversation.",
+            reply=("This conversation is already linked to another employee. Please start a new conversation."
+                   if req.user else
+                   "This conversation is linked to an employee. Please send your work email with every message."),
             state="identity_mismatch",
         )
+    claimed = False
     if req.user and not current:
+        # First email on this conversation: link it only after its anonymous past is gone (V6).
+        try:
+            claimed = await clear_anonymous_history(req.session_id, session)
+        except Exception:  # could not forget the history: do not link the email, do not run the graph
+            log.exception("chat session=%s: could not clear the anonymous history", session_ref(req.session_id))
+            return agent_error_reply(req.session_id)
+        if claimed:
+            log.info("chat session=%s: anonymous history cleared before linking an email",
+                     session_ref(req.session_id))
         session["user"] = req.user.model_dump()
     email = (session["user"] or {}).get("email")
-    log.info("chat session=%s user=%s", req.session_id, email)
+    log.info("chat session=%s user=%s", session_ref(req.session_id), email)
+
+    # Secrets never reach the agent, the checkpoint database or an external API (SP-001).
+    message = redact_secrets(req.message)
+    if message != req.message:
+        log.info("chat session=%s: secrets redacted from the message", session_ref(req.session_id))
 
     # The session's (locked) email is the source of truth for user_email; active_incident is set by
     # the graph on every turn. Only plain strings and LangChain messages go into the checkpoint.
-    turn: dict = {"messages": [HumanMessage(content=req.message)]}
+    # The message has its own id, so it can be replaced after the turn (see below).
+    human = HumanMessage(content=message, id=str(uuid.uuid4()))
+    turn: dict = {"messages": [human]}
     if email:
         turn["user_email"] = email
     try:
         out = await graph.ainvoke(turn, config)
+        # Instructions aimed at the assistant are answered this turn only, never replayed from the history (V4).
+        if looks_like_instructions(message):
+            await graph.aupdate_state(config, {"messages": [HumanMessage(content=WITHHELD, id=human.id)]},
+                                      as_node=FINAL_NODE)
+            log.info("chat session=%s: instruction-like message withheld from later turns",
+                     session_ref(req.session_id))
+        # Keep the stored conversation bounded: the last messages only, and only the newest checkpoint.
+        await trim_history(graph, config)
+        await prune_thread(app.state.checkpointer, req.session_id)
     except Exception:  # the checkpoint database or a node failed: reply honestly, never a 500
-        log.exception("chat session=%s: the agent failed", req.session_id)
-        return ChatResponse(
-            session_id=req.session_id,
-            reply="Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
-            state="error",
-        )
+        log.exception("chat session=%s: the agent failed", session_ref(req.session_id))
+        return agent_error_reply(req.session_id)
     return ChatResponse(
         session_id=req.session_id,
-        reply=out["reply"],
+        reply=f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"],
         state="skeleton",
         tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])],
     )
@@ -187,15 +354,43 @@ async def approve(req: ApproveRequest) -> ChatResponse:
     without it, a Reject arriving while create_ticket is in flight said "not filed" for a filed ticket.
     """
     session = get_session(req.session_id)
-    async with session["lock"]:
-        return await _approve(req, session)
+    try:
+        async with session_turn(session):
+            return await _approve(req, session)
+    except SessionBusy:
+        log.info("approve session=%s busy: an earlier request is still running", session_ref(req.session_id))
+        return ChatResponse(
+            session_id=req.session_id,
+            reply=("I'm still working on an earlier request in this conversation, so I did not act on this one. "
+                   "Please try again in a moment."),
+            state="busy",
+        )
+
+
+async def _save_or_log(session_id: str, session: dict) -> None:
+    """Persist the gate's state. A failure is logged, never turned into a wrong answer about the ticket."""
+    try:
+        await save_approval_state(session_id, session)
+    except Exception:
+        log.exception("approve session=%s: could not save the approval state", session_ref(session_id))
 
 
 async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
+    # After a restart or an eviction, the draft and the filed record come back from the checkpoint.
+    try:
+        await load_session(req.session_id, session)
+    except Exception:  # cannot know the draft's state: write nothing, and say so
+        log.exception("approve session=%s: could not load the saved approval state", session_ref(req.session_id))
+        return ChatResponse(
+            session_id=req.session_id,
+            reply="I could not check the ticket draft right now, so nothing was filed. Please try again in a moment.",
+            state="error",
+        )
+
     # Replay of an approval that already created a ticket (double click): never write twice.
     already = session["filed"].get(req.action_id)
     if already:
-        log.info("approve replay session=%s action=%s ticket=%s", req.session_id, req.action_id, already)
+        log.info("approve replay session=%s action=%s ticket=%s", session_ref(req.session_id), req.action_id, already)
         reply = (f"This ticket was already filed as {already}. I did not file it again." if req.approved else
                  f"This ticket was already filed as {already}, so it can no longer be rejected.")
         return ChatResponse(
@@ -209,7 +404,7 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
     pending = session["pending_action"]
     if pending is None or pending.action_id != req.action_id:
         log.info("approve ignored session=%s action=%s (no matching pending action)",
-                 req.session_id, req.action_id)
+                 session_ref(req.session_id), req.action_id)
         return ChatResponse(
             session_id=req.session_id,
             reply="There is no ticket draft waiting for approval, so nothing was filed.",
@@ -217,7 +412,8 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
 
     if not req.approved:
         session["pending_action"] = None
-        log.info("approve rejected session=%s action=%s", req.session_id, req.action_id)
+        await _save_or_log(req.session_id, session)
+        log.info("approve rejected session=%s action=%s", session_ref(req.session_id), req.action_id)
         return ChatResponse(
             session_id=req.session_id,
             reply="Okay, I did not file the ticket. Tell me if you want to change anything.",
@@ -230,8 +426,10 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
     if data.get("ok") and TICKET_ID.fullmatch(ticket_id):
         session["pending_action"] = None
         session["filed"][pending.action_id] = ticket_id
+        await _save_or_log(req.session_id, session)
         team = data["ticket"].get("assigned_team") or ROUTING.get(pending.payload["category"], "IT")
-        log.info("ticket created session=%s action=%s ticket=%s", req.session_id, pending.action_id, ticket_id)
+        log.info("ticket created session=%s action=%s ticket=%s", session_ref(req.session_id), pending.action_id,
+                 ticket_id)
         return ChatResponse(
             session_id=req.session_id,
             reply=f"Done. Your ticket is {ticket_id}. {team} will contact you.",
@@ -245,7 +443,8 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
     reply, can_retry = ticket_failure_reply(error)
     if not can_retry:
         session["pending_action"] = None
-    log.warning("ticket not created session=%s action=%s error=%s", req.session_id, pending.action_id,
+        await _save_or_log(req.session_id, session)
+    log.warning("ticket not created session=%s action=%s error=%s", session_ref(req.session_id), pending.action_id,
                 error.get("code"))
     return ChatResponse(
         session_id=req.session_id,
@@ -267,12 +466,20 @@ async def delete_all_threads(checkpointer: AsyncSqliteSaver) -> int:
     return len(thread_ids)
 
 
+def admin_token_ok(token: str | None) -> bool:
+    """True if the X-Admin-Token header matches APP_ADMIN_TOKEN. Always False when APP_ADMIN_TOKEN is not set."""
+    expected = os.getenv("APP_ADMIN_TOKEN") or ""
+    return bool(expected) and secrets.compare_digest(token or "", expected)
+
+
 @app.post("/reset")
 async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Header(default=None)) -> dict:
     """Clear our app's session state and saved conversations. Never touches the knowledge base or the helpdesk API.
 
-    One session: open to anyone who knows its id. Its in-memory state and its checkpoint thread (messages,
-    user_email) are deleted, so the same session id starts fresh, even for another employee.
+    One session: its in-memory state and its checkpoint thread (messages, user_email) are deleted, so the same
+    session id starts fresh, even for another employee. A conversation linked to an employee can only be reset
+    with that employee's email in "user" (the same rule as /api/chat) or with the admin token (V11); an
+    anonymous one by anyone who knows its id, who could continue it anyway.
     Every session: needs the X-Admin-Token header to match APP_ADMIN_TOKEN, and is disabled when
     APP_ADMIN_TOKEN is not set. It deletes every thread in the checkpoint database, including ones no longer
     in memory (after an eviction or a restart). Limitation: it does not wait for requests already in progress;
@@ -282,18 +489,15 @@ async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Hea
     if req and req.session_id:
         # get_session also covers a session that is only on disk: its lock then guards the deletion too.
         session = get_session(req.session_id)
-        async with session["lock"]:              # wait for a request of this session to finish
-            try:
-                await checkpointer.adelete_thread(req.session_id)
-            except Exception:
-                log.exception("reset session=%s: could not delete the saved conversation", req.session_id)
-                raise HTTPException(status_code=500, detail="The saved conversation could not be deleted.")
-            sessions.pop(req.session_id, None)
-        log.info("reset session=%s (in-memory state and saved conversation deleted)", req.session_id)
+        try:
+            async with session_turn(session):        # wait (a limited time) for a request of this session
+                await _reset_one(req, session, x_admin_token)
+        except SessionBusy:
+            raise HTTPException(status_code=409, detail="This conversation is busy. Try the reset again in a moment.")
+        log.info("reset session=%s (in-memory state and saved conversation deleted)", session_ref(req.session_id))
         return {"status": "ok", "reset": req.session_id}
 
-    expected = os.getenv("APP_ADMIN_TOKEN") or ""
-    if not expected or not secrets.compare_digest(x_admin_token or "", expected):
+    if not admin_token_ok(x_admin_token):
         log.warning("reset of all sessions refused (missing or wrong admin token)")
         raise HTTPException(status_code=403, detail="Resetting every session needs a valid X-Admin-Token.")
     count = len(sessions)
@@ -305,3 +509,25 @@ async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Hea
     sessions.clear()
     log.info("reset all sessions: %d in memory cleared, %d saved conversations deleted", count, threads)
     return {"status": "ok", "reset": "all", "sessions_cleared": count, "threads_deleted": threads}
+
+
+async def _reset_one(req: ResetRequest, session: dict, x_admin_token: str | None) -> None:
+    """Delete one conversation, if the caller may. Call under the session's lock. Raises HTTPException otherwise."""
+    try:
+        await load_session(req.session_id, session)  # the linked email may be only on disk
+    except Exception:
+        log.exception("reset session=%s: could not load the saved conversation", session_ref(req.session_id))
+        raise HTTPException(status_code=500,
+                            detail="The saved conversation could not be checked, so nothing was deleted.")
+    linked = (session["user"] or {}).get("email")
+    if linked and not (req.user and req.user.email == linked) and not admin_token_ok(x_admin_token):
+        log.warning("reset session=%s refused: the request does not name the linked employee",
+                    session_ref(req.session_id))
+        raise HTTPException(status_code=403,
+                            detail="This conversation is linked to an employee. Send the same work email to reset it.")
+    try:
+        await app.state.checkpointer.adelete_thread(req.session_id)
+    except Exception:
+        log.exception("reset session=%s: could not delete the saved conversation", session_ref(req.session_id))
+        raise HTTPException(status_code=500, detail="The saved conversation could not be deleted.")
+    sessions.pop(req.session_id, None)

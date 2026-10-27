@@ -125,7 +125,21 @@ def test_a_session_cannot_switch_to_another_employee(client):
 def test_the_same_employee_can_keep_talking(client):
     chat(client, user=SARA)
     assert chat(client, user={"email": "  Sara.Mikhail@nakhla.example "}).json()["state"] != "identity_mismatch"
-    assert chat(client).json()["state"] != "identity_mismatch"                  # user omitted later
+
+
+def test_a_linked_session_cannot_be_continued_without_the_email(client):
+    # V5: someone who only knows the session id (it is in the logs) must not act as its owner.
+    chat(client, user=SARA)
+    r = chat(client).json()                                                     # no user at all
+    assert r["state"] == "identity_mismatch" and r["tool_calls"] == []
+    assert "send your work email" in r["reply"]
+    assert get_session("s-1")["user"] == SARA
+
+
+def test_an_anonymous_session_can_keep_talking_without_an_email(client):
+    # Sessions that never named an employee (sample case S2-02) are not affected.
+    assert chat(client).json()["state"] == "skeleton"
+    assert chat(client).json()["state"] == "skeleton"
 
 
 # ------------------------------------------------------------- 5. the session store is bounded

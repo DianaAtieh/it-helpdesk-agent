@@ -22,8 +22,14 @@ services:
   #     # inside compose the API is reached by its service name, not localhost
   #     HELPDESK_API_URL: http://helpdesk-api:8102
   #     HELPDESK_API_KEY: ${HELPDESK_API_KEY:-dev-key-change-me}
+  #     CHECKPOINT_DB: /data/checkpoints.db
+  #   volumes:
+  #     - checkpoints:/data           # saved conversations live in a volume, never in the image
   #   # your image must contain services/helpdesk_mcp.py, mcp and httpx: your app starts
   #   # the MCP server as a subprocess (python -m services.helpdesk_mcp) over stdio
   #   depends_on:
   #     helpdesk-api:
   #       condition: service_healthy
+
+# volumes:                          # uncomment together with the app: block
+#   checkpoints:

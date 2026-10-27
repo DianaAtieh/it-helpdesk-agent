@@ -153,7 +153,7 @@ def decide(approved: bool, history: list, session_id: str, pending: dict | None)
 
 
 with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
-    session = gr.State(lambda: f"ui-{uuid.uuid4().hex[:10]}")
+    session = gr.State(lambda: f"ui-{uuid.uuid4().hex}")  # 128 random bits: the id is all that proves the session
     pending_state = gr.State(None)
     gr.HTML(HEADER)
     with gr.Row():

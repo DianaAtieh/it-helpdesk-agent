@@ -1,0 +1,22 @@
+# Never bake secrets, saved conversations or local caches into an image (V2).
+# Docker reads this for every build whose context is this folder (see docker-compose.yml).
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# saved conversations (the SQLite checkpointer): give the container a volume instead
+app/data/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# local environments, caches and generated files
+.venv/
+venv/
+.git/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+evals/scorecard.*

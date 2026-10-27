@@ -72,7 +72,7 @@ def test_the_chat_turn_is_saved_in_the_checkpointer(client):
 def test_messages_accumulate_across_turns_of_one_session(client):
     sid = new_session()
     chat(client, sid, "first", SARA)
-    second = chat(client, sid, "second")                                         # user omitted later: fine
+    second = chat(client, sid, "second", SARA)
 
     messages = saved(client, sid)["messages"]
     assert [m.content for m in messages if isinstance(m, HumanMessage)] == ["first", "second"]
@@ -84,7 +84,7 @@ def test_two_sessions_have_separate_histories_and_users(client):
     a, b = new_session(), new_session()
     chat(client, a, "from A", SARA)
     chat(client, b, "from B", SAMIR)
-    chat(client, a, "again from A")
+    chat(client, a, "again from A", SARA)
 
     state_a, state_b = saved(client, a), saved(client, b)
     assert [m.content for m in state_a["messages"] if isinstance(m, HumanMessage)] == ["from A", "again from A"]

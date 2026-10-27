@@ -12,10 +12,15 @@ from langgraph.graph import END, START, StateGraph
 from app.agent.nodes import MCPClient, make_check_status
 from app.agent.state import AgentState
 
+# The node that ends every turn. Updates made outside a run (the approval gate saving its state,
+# trimming old messages) are recorded as coming from it (aupdate_state(..., as_node=FINAL_NODE)),
+# so nothing is left pending and the next turn starts from START. Keep it in step with the edges.
+FINAL_NODE = "check_status"
+
 
 def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient):
     graph = StateGraph(AgentState)
     graph.add_node("check_status", make_check_status(mcp))
     graph.add_edge(START, "check_status")
-    graph.add_edge("check_status", END)
+    graph.add_edge(FINAL_NODE, END)
     return graph.compile(checkpointer=checkpointer)

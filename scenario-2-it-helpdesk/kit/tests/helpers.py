@@ -7,8 +7,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import get_session, mcp
-from app.tickets import TicketDraft, propose_ticket
+from app.main import propose_draft
+from app.tickets import TicketDraft
 
 API = (os.getenv("HELPDESK_API_URL") or "http://localhost:8102").rstrip("/")
 
@@ -38,8 +38,9 @@ def make_draft(**overrides) -> TicketDraft:
 
 
 def propose(client: TestClient, session_id: str, draft: TicketDraft):
-    # propose_ticket uses the app's MCP session, so it must run on the app's event loop.
-    action, _ = client.portal.call(propose_ticket, get_session(session_id), draft, mcp)
+    # The same path the agent will use (load, check, save). It uses the app's MCP session and
+    # checkpointer, so it must run on the app's event loop.
+    action, _ = client.portal.call(propose_draft, session_id, draft)
     return action
 
 

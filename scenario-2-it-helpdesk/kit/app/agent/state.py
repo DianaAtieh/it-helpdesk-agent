@@ -22,3 +22,8 @@ class AgentState(TypedDict, total=False):
     # No reducer: each turn overwrites them, so they never carry over from the previous turn.
     reply: str
     tool_calls: list[dict]
+    # The approval gate's state, saved so it survives a restart or an eviction from memory
+    # (written by app/main.py, never by a node): the ticket draft waiting for approval as a plain
+    # PendingAction dict, and {action_id: ticket_id} for drafts that already became tickets.
+    pending_action: dict | None
+    filed: dict[str, str]
