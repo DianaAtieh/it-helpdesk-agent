@@ -14,25 +14,48 @@ A Nakhla employee describes an IT problem in a chat window and gets either a ste
 
 ```mermaid
 flowchart LR
-    UI[Gradio UI :7860] --> API[Our FastAPI :8000<br/>/api/chat · /api/approve]
-    API --> G{{LangGraph agent}}
-    G --> IG[Input guard]
-    IG --> T[Triage]
-    T --> R[Resolver]
-    R --> RAG[(SQLite: chunks + embeddings)]
-    R --> P[Precedence filter<br/>Python, not prompt]
-    P --> OG[Output guard]
-    T --> E[Escalation: ticket draft]
-    E --> OG
-    OG --> API
-    API -- "approve only" --> GATE[Approval gate<br/>our code]
-    G -. read tools .-> MCP[helpdesk MCP server<br/>stdio]
+    subgraph HOST["Docker Compose (local, then AWS EC2)"]
+        UI[Gradio UI :7860]
+        subgraph APP["Our FastAPI :8000"]
+            HTTP["GET /health<br/>POST /api/chat<br/>POST /api/approve<br/>POST /reset"]
+            WS["WS /ws/chat<br/>streams tokens + events"]
+            GATE[Approval gate<br/>our code]
+        end
+        G{{LangGraph agent}}
+        IG[Input guard] --> T[Triage]
+        T --> R[Resolver]
+        R --> P[Precedence filter<br/>Python, not prompt]
+        P --> OG[Output guard]
+        T --> E[Escalation: ticket draft]
+        E --> OG
+        DB[(SQLite on a volume<br/>chunks + embeddings · FTS5<br/>checkpoints · long-term memory)]
+        MCP[helpdesk MCP server<br/>stdio subprocess]
+        HD[Helpdesk API :8102<br/>simulated, internal only]
+    end
+    OR[OpenRouter<br/>chat model + embeddings]
+
+    UI -- HTTP --> HTTP
+    UI -. "WebSocket (optional)" .-> WS
+    HTTP --> G
+    WS --> G
+    G --> IG
+    OG --> HTTP
+    OG --> WS
+    R <--> DB
+    G <--> DB
+    G --> OR
+    R --> OR
+    G -. read tools .-> MCP
+    HTTP -- "approve only" --> GATE
     GATE -. create_ticket .-> MCP
-    MCP --> HD[Helpdesk API :8102<br/>simulated]
-    G <--> MEM[(SQLite: checkpoints<br/>+ long-term memory)]
+    MCP --> HD
 ```
 
+- **Stack:** Python 3.12 · LangGraph · Pydantic · FastAPI (HTTP + WebSockets) · SQLite (+ FTS5) · NumPy cosine · OpenRouter (chat model + `openai/text-embedding-3-small`) · kit MCP server · Gradio · pytest + kit eval runner · Docker Compose · AWS EC2.
+- **HTTP is the graded path:** the contract, the eval runner, the hidden tests and the Gradio starter all use `/api/chat` and `/api/approve`. `WS /ws/chat` streams the same agent's reply and events (`token`, `tool_call`, `pending_action`, `done`, `error`) and must end in the same ChatResponse. Approval always goes through `POST /api/approve`, never over the socket.
+- **`POST /reset`** clears **our** app's session state (one session or all); it never touches the knowledge base index and is separate from the helpdesk API's test-only `/admin/reset`.
 - **Offline ingestion** (one command, re-runnable): 20 docs (18 MD + 2 PDF) → loader → section-aware chunker (both done on `feature/offline-rag`) → OpenRouter embeddings → SQLite.
+- **Deployment:** on EC2 only the UI (or a proxy on 80/443) is public; port 8102 stays internal because its `/admin/*` endpoints have no key. SQLite lives on a Docker volume so it survives restarts.
 - The final diagram goes in the README; the editable starting point is `visuals/editable/s2-architecture.drawio`.
 
 ## 3. Roles (at least two, with different jobs)
