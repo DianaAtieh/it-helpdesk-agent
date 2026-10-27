@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent.graph import build_graph
-from app.main import describe_status
+from app.agent.nodes import describe_status
 from app.schemas import ToolCall
 
 INC_2207 = {"id": "INC-2207", "status": "active", "priority": "P1", "service": "vpn",

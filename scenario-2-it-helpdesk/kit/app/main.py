@@ -2,9 +2,9 @@
 
     uvicorn app.main:app --port 8000 --reload
 
-Endpoints follow common/CONTRACT.md. The agent is not connected yet: /api/chat
-checks the real status page through MCP and returns it in the ChatResponse shape
-(walking skeleton: UI -> our API -> MCP -> helpdesk API -> reply).
+Endpoints follow common/CONTRACT.md. /api/chat runs the LangGraph agent (app/agent/), whose
+conversation memory is saved in SQLite per session_id. Phase 1: the graph has one node that checks
+the real status page through MCP (UI -> our API -> graph -> MCP -> helpdesk API -> reply).
 
 The helpdesk API must be running on port 8102 (uvicorn services.helpdesk_api:app --port 8102).
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 KIT = Path(__file__).resolve().parent.parent
@@ -27,8 +28,10 @@ KIT = Path(__file__).resolve().parent.parent
 # The kit's .env, without overriding variables that are already set (e.g. by Docker).
 load_dotenv(KIT / ".env", override=False)
 
-from app.mcp_client import HelpdeskMCP  # noqa: E402  (after load_dotenv on purpose)
-from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest  # noqa: E402
+from app.agent.graph import build_graph  # noqa: E402  (after load_dotenv on purpose)
+from app.agent.nodes import describe_status  # noqa: E402,F401  (re-exported: it used to live here)
+from app.mcp_client import HelpdeskMCP  # noqa: E402
+from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest, ToolCall  # noqa: E402
 from app.tickets import ROUTING, TICKET_ID  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -55,12 +58,14 @@ async def lifespan(app: FastAPI):
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
+        app.state.graph = build_graph(checkpointer, mcp)
         log.info("checkpointer ready: %s", db_path)
         await mcp.start()
         try:
             yield
         finally:
             await mcp.stop()
+            app.state.graph = None
             app.state.checkpointer = None
 
 
@@ -109,22 +114,9 @@ def ticket_failure_reply(error: dict) -> tuple[str, bool]:
             "You can approve again in a moment to retry."), True
 
 
-def describe_status(data: dict) -> str:
-    """Turn a get_service_status result into a short reply."""
-    if not data.get("ok"):
-        code = (data.get("error") or {}).get("code", "unknown")
-        return f"I could not check the status page right now ({code}). Please try again in a moment."
-    status = data["status"]
-    active = [i for i in status.get("incidents", []) if i.get("status") == "active"]
-    if not active:
-        return "The status page shows no active incidents right now."
-    lines = ["The status page shows these active incidents:"]
-    for inc in active:
-        line = f"- {inc['id']} ({inc.get('priority', '?')}): {inc.get('title', '')}"
-        if inc.get("workaround"):
-            line += f". Workaround: {inc['workaround']}"
-        lines.append(line)
-    return "\n".join(lines)
+def thread_config(session_id: str) -> dict:
+    """The LangGraph config for one conversation: its checkpoints are stored under this thread id."""
+    return {"configurable": {"thread_id": session_id}}
 
 
 @app.get("/health")
@@ -140,6 +132,16 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 
 async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
+    graph = app.state.graph
+    config = thread_config(req.session_id)
+
+    # The saved conversation outlives the in-memory session (evicted, or the app restarted): take the
+    # email back from the checkpoint, so the identity lock below still holds for this conversation.
+    if session["user"] is None:
+        saved_email = (await graph.aget_state(config)).values.get("user_email")
+        if saved_email:
+            session["user"] = {"email": saved_email}
+
     # Without a login the email is a claim, but a conversation cannot switch to another employee
     # (e.g. to a VIP for a P1 ticket) once it started.
     current = (session["user"] or {}).get("email")
@@ -152,15 +154,28 @@ async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
         )
     if req.user and not current:
         session["user"] = req.user.model_dump()
-    log.info("chat session=%s user=%s", req.session_id, (session["user"] or {}).get("email"))
+    email = (session["user"] or {}).get("email")
+    log.info("chat session=%s user=%s", req.session_id, email)
 
-    # Walking skeleton: one real MCP read. The LangGraph agent replaces this later.
-    status, call = await mcp.call("get_service_status")
+    # The session's (locked) email is the source of truth for user_email; active_incident is set by
+    # the graph on every turn. Only plain strings and LangChain messages go into the checkpoint.
+    turn: dict = {"messages": [HumanMessage(content=req.message)]}
+    if email:
+        turn["user_email"] = email
+    try:
+        out = await graph.ainvoke(turn, config)
+    except Exception:  # the checkpoint database or a node failed: reply honestly, never a 500
+        log.exception("chat session=%s: the agent failed", req.session_id)
+        return ChatResponse(
+            session_id=req.session_id,
+            reply="Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
+            state="error",
+        )
     return ChatResponse(
         session_id=req.session_id,
-        reply=describe_status(status),
+        reply=out["reply"],
         state="skeleton",
-        tool_calls=[call],
+        tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])],
     )
 
 
