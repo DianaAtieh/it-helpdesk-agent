@@ -42,6 +42,10 @@ from ingestion.eligibility import (ACTIONABLE, CONDITIONAL, CONTEXT_ONLY, EXCLUD
 from ingestion.embeddings import EmbeddingProvider
 from ingestion.hybrid import HybridResult, HybridRetriever
 from ingestion.retrieval import QueryError
+from ingestion.rule_inventory import DEFAULT_INVENTORY, ChunkRef, InventoryError, RuleInventory, load_inventory
+from ingestion.rule_lanes import (DEFAULT_MAX_DEPARTMENT_RULES, DEFAULT_MAX_GOVERNING_POLICY, DEPARTMENT_REQUIRED,
+                                  LANE_DEPARTMENT, LANE_GOVERNING, NOTE_RULES, UNAVAILABLE, AnswerRuleItem, RuleIndexEntry,
+                                  RuleLane, answer_item, build_lane, unavailable_lane)
 
 DEFAULT_MIN_SEMANTIC_SCORE = 0.25
 DEFAULT_MAX_CONTEXT = 3
@@ -157,6 +161,11 @@ class AnswerView:
     sufficiency: Sufficiency
     scope_validated: bool  # always False: scope and same-point conflicts are the verifier's job
     notes: tuple[str, ...]
+    department_rules: tuple[AnswerRuleItem, ...] = ()
+    governing_policy: tuple[AnswerRuleItem, ...] = ()
+    rule_coverage: Mapping[str, str] = MappingProxyType({})
+    rule_index: tuple[RuleIndexEntry, ...] = ()  # metadata only; set while the department is unknown
+    rule_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -175,6 +184,12 @@ class PolicyResponse:
     department: str | None
     pool_size: int
     pool_complete: bool
+    department_rules: RuleLane = RuleLane(LANE_DEPARTMENT, UNAVAILABLE)
+    governing_policy: RuleLane = RuleLane(LANE_GOVERNING, UNAVAILABLE)
+
+    @property
+    def rule_warnings(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.department_rules.warnings, *self.governing_policy.warnings)))
 
     @property
     def undocumented_codes(self) -> tuple[str, ...]:
@@ -195,10 +210,17 @@ class PolicyResponse:
     def for_answering(self) -> AnswerView:
         """The only supported input for answer generation: actionable and conditional evidence, nothing else."""
         items = sorted((*self.actionable, *self.conditional), key=lambda i: i.policy_rank)
-        needs = self.applicability.requires_department_verification
-        notes = [NOTE_CODES, NOTE_CONFLICTS, NOTE_SCOPE] + ([NOTE_DEPARTMENT] if needs else [])
+        needs = (self.applicability.requires_department_verification
+                 or self.department_rules.coverage == DEPARTMENT_REQUIRED)
+        notes = [NOTE_CODES, NOTE_CONFLICTS, NOTE_SCOPE, NOTE_RULES] + ([NOTE_DEPARTMENT] if needs else [])
+        rules = {lane.lane: tuple(answer_item(lane.lane, i) for i in lane.items)
+                 for lane in (self.department_rules, self.governing_policy)}
         return AnswerView(tuple(self._answer(i) for i in items), self.query_codes, self.code_coverage,
-                          self.undocumented_codes, self.department, needs, self.sufficiency, False, tuple(notes))
+                          self.undocumented_codes, self.department, needs, self.sufficiency, False, tuple(notes),
+                          rules[LANE_DEPARTMENT], rules[LANE_GOVERNING],
+                          MappingProxyType({LANE_DEPARTMENT: self.department_rules.coverage,
+                                            LANE_GOVERNING: self.governing_policy.coverage}),
+                          self.department_rules.index, self.rule_warnings)
 
     def context_for_background(self) -> tuple[AnswerEvidence, ...]:
         """Current but non-authoritative text. Background only: never instructions, never cited as a basis."""
@@ -228,7 +250,14 @@ def _rank_key(result: HybridResult):
 class PolicyRetriever:
     def __init__(self, db_path: Path | str, provider: EmbeddingProvider, *,
                  min_semantic_score: float = DEFAULT_MIN_SEMANTIC_SCORE, max_context: int = DEFAULT_MAX_CONTEXT,
-                 manifest_path: Path | str | None = None) -> None:
+                 manifest_path: Path | str | None = None, inventory_path: Path | str | None = DEFAULT_INVENTORY,
+                 max_department_rules: int = DEFAULT_MAX_DEPARTMENT_RULES,
+                 max_governing_policy: int = DEFAULT_MAX_GOVERNING_POLICY) -> None:
+        for name, value in (("max_department_rules", max_department_rules), ("max_governing_policy", max_governing_policy)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise QueryError(f"{name} must be a non-negative integer")
+        self.max_department_rules = max_department_rules
+        self.max_governing_policy = max_governing_policy
         if (isinstance(min_semantic_score, bool) or not isinstance(min_semantic_score, (int, float))
                 or not math.isfinite(min_semantic_score) or not -1.0 <= min_semantic_score <= 1.0):
             raise QueryError("min_semantic_score must be a finite number between -1 and 1")
@@ -244,6 +273,15 @@ class PolicyRetriever:
                 tuple(json.loads(row["applies_to"]))))
         self._facts = facts
         self._superseders = superseded_by(facts.values())
+        self._inventory: RuleInventory | None = None
+        self.inventory_warning: str | None = None
+        if inventory_path is not None:
+            try:
+                refs = [ChunkRef(r["chunk_id"], r["doc_id"], tuple(json.loads(r["heading_path"])), r["text"],
+                                 r["status"], bool(r["authoritative"])) for r in self.hybrid.semantic.chunk_rows]
+                self._inventory = load_inventory(inventory_path, refs)
+            except (InventoryError, ValueError, KeyError, TypeError) as exc:
+                self.inventory_warning = str(exc)
         self._conflicts: tuple[KnownConflict, ...] = ()
         self.annotation_warning: str | None = None
         if manifest_path is not None:
@@ -320,6 +358,32 @@ class PolicyRetriever:
         governing = tuple(i.chunk_id for i in actionable if i.doc_id.startswith("SP-"))
         relevant_docs = {r.chunk.doc_id for r, _ in (*answer, *context)} | {d.doc_id for d in diagnostics}
         annotations = annotate(self._conflicts, relevant_docs) if self._conflicts else ()
+
+        # Rule lanes (Phase 2D): additive, built after ranking so the evidence above is untouched. The topic signal
+        # is the top_k best relevant eligible chunks plus relevant chunks of current, authoritative documents that
+        # were excluded ONLY for a department mismatch (metadata signal; their text is never exposed).
+        signal_pairs = [(r, v) for r, v in answer]
+        for result in pool.results:
+            facts = self._facts[result.chunk.doc_id]
+            verdict = classify(facts, self._superseders, department)
+            if (verdict.tier == EXCLUDED and verdict.reasons == ("APPLICABILITY_MISMATCH",)
+                    and facts.status == "current" and facts.authoritative
+                    and (result.matched_codes or result.semantic_score >= self.min_semantic_score)):
+                signal_pairs.append((result, verdict))
+        signal_pairs.sort(key=lambda pair: _rank_key(pair[0]))
+        signal = [r.chunk_id for r, _ in signal_pairs[:top_k]]
+        main_ids = {i.chunk_id for i in (*actionable, *conditional)}
+        by_chunk = {r.chunk_id: r for r in pool.results}
+        classify_doc = lambda doc_id: classify(self._facts[doc_id], self._superseders, department)  # noqa: E731
+        if self._inventory is None:
+            dept_lane = unavailable_lane(LANE_DEPARTMENT, self.inventory_warning or "inventory disabled")
+            gov_lane = unavailable_lane(LANE_GOVERNING, self.inventory_warning or "inventory disabled")
+        else:
+            dept_lane = build_lane(LANE_DEPARTMENT, self._inventory, signal, department, by_chunk=by_chunk,
+                                   classify_doc=classify_doc, main_ids=main_ids, max_supporting=self.max_department_rules)
+            gov_lane = build_lane(LANE_GOVERNING, self._inventory, signal, department, by_chunk=by_chunk,
+                                  classify_doc=classify_doc, main_ids=main_ids, max_supporting=self.max_governing_policy)
         return PolicyResponse(tuple(actionable), tuple(conditional), context_items, tuple(diagnostics), pool.query_codes,
                               coverage, applicability, sufficiency, governing, annotations, self.annotation_warning,
-                              department, len(pool.results), len(pool.results) == len(self.hybrid))
+                              department, len(pool.results), len(pool.results) == len(self.hybrid),
+                              dept_lane, gov_lane)
