@@ -1,0 +1,139 @@
+{
+  "inventory_version": 1,
+  "topics": {
+    "vpn": [
+      {"doc_id": "KB-002"},
+      {"doc_id": "SP-002", "heading": "3. Which devices may connect"},
+      {"doc_id": "SP-002", "heading": "4. Do not weaken device security"}
+    ],
+    "mfa": [
+      {"doc_id": "KB-007"},
+      {"doc_id": "SP-002", "heading": "1. Multi-factor authentication (MFA)"},
+      {"doc_id": "SP-002", "heading": "2. Lost or stolen devices"}
+    ],
+    "password": [
+      {"doc_id": "KB-004"},
+      {"doc_id": "KB-006"},
+      {"doc_id": "SP-001"}
+    ],
+    "software-admin": [
+      {"doc_id": "KB-009"},
+      {"doc_id": "KB-010", "heading": "Compliance rules"},
+      {"doc_id": "SP-002", "heading": "5. Administrator rights"}
+    ],
+    "access-request": [
+      {"doc_id": "KB-011"}
+    ]
+  },
+  "rules": [
+    {
+      "rule_id": "DEPT-FINANCE-VPN",
+      "kind": "department_exception",
+      "department": "Finance",
+      "topic": "vpn",
+      "anchors": [
+        {"doc_id": "KB-002", "heading": "Exceptions", "role": "primary",
+         "quote": "**Finance:** VPN and remote-access problems go **straight to Security Operations**"},
+        {"doc_id": "KB-016", "heading": "Matrix", "role": "primary",
+         "quote": "All VPN and remote-access problems go straight to Security Operations"},
+        {"doc_id": "KB-002", "heading": "Gateways", "role": "primary",
+         "quote": "Finance users cannot change gateway."},
+        {"doc_id": "KB-015", "heading": "3. Categories and who handles them", "role": "supporting",
+         "quote": "**all Finance VPN issues**"}
+      ]
+    },
+    {
+      "rule_id": "DEPT-CONTRACTORS-VPN",
+      "kind": "department_exception",
+      "department": "Contractors",
+      "topic": "vpn",
+      "anchors": [
+        {"doc_id": "KB-016", "heading": "Matrix", "role": "primary",
+         "quote": "**No VPN.** Only the Nakhla Workspace VDI portal"},
+        {"doc_id": "SP-002", "heading": "3. Which devices may connect", "role": "primary",
+         "quote": "**Contractors have no VPN access.**"},
+        {"doc_id": "KB-002", "heading": "Exceptions", "role": "supporting",
+         "quote": "**Contractors:** no VPN access."},
+        {"doc_id": "KB-011", "heading": "Contractors", "role": "supporting",
+         "quote": "Contractors can never be added to VPN-Users"}
+      ]
+    },
+    {
+      "rule_id": "DEPT-EXECUTIVE-OFFICE-VIP",
+      "kind": "department_exception",
+      "department": "Executive Office",
+      "topic": "*",
+      "anchors": [
+        {"doc_id": "KB-016", "heading": "Matrix", "role": "primary",
+         "quote": "**VIP: every ticket is P1**"},
+        {"doc_id": "KB-015", "heading": "2. Priorities", "role": "primary",
+         "quote": "the requester is in the **Executive Office** (VIP)"},
+        {"doc_id": "KB-002", "heading": "Exceptions", "role": "supporting",
+         "quote": "**Executive Office:** every ticket is **P1 (VIP)**"}
+      ]
+    },
+    {
+      "rule_id": "DEPT-ENGINEERING-DEVICES",
+      "kind": "department_exception",
+      "department": "Engineering",
+      "topic": "software-admin",
+      "anchors": [
+        {"doc_id": "KB-009", "heading": "Administrator rights", "role": "primary",
+         "quote": "**Engineering only:** Software Center > **Elevate**"},
+        {"doc_id": "KB-016", "heading": "Matrix", "role": "primary",
+         "quote": "May use Ubuntu 22.04 LTS laptops"},
+        {"doc_id": "KB-010", "heading": "Compliance rules", "role": "supporting",
+         "quote": "Ubuntu: Engineering only"},
+        {"doc_id": "SP-002", "heading": "5. Administrator rights", "role": "supporting",
+         "quote": "Engineering staff may use the time-limited **Elevate** function"}
+      ]
+    },
+    {
+      "rule_id": "DEPT-HR-PEOPLE-DATA",
+      "kind": "department_exception",
+      "department": "HR",
+      "topic": "access-request",
+      "anchors": [
+        {"doc_id": "KB-011", "heading": "Standard groups", "role": "primary",
+         "quote": "HR-People | NakhlaPeople (HR data)"},
+        {"doc_id": "KB-016", "heading": "Matrix", "role": "primary",
+         "quote": "HR data (NakhlaPeople, HR-People group) is approved by the HR Director only"}
+      ]
+    },
+    {
+      "rule_id": "GOV-SP002-VPN-DEVICES",
+      "kind": "governing_policy",
+      "topic": "vpn",
+      "anchors": [
+        {"doc_id": "SP-002", "heading": "3. Which devices may connect", "role": "primary",
+         "quote": "Only company devices that are enrolled in **NakhlaManage**"},
+        {"doc_id": "SP-002", "heading": "4. Do not weaken device security", "role": "primary",
+         "quote": "bypassing or turning off the NakhlaConnect posture or version check"}
+      ]
+    },
+    {
+      "rule_id": "GOV-SP002-MFA",
+      "kind": "governing_policy",
+      "topic": "mfa",
+      "anchors": [
+        {"doc_id": "SP-002", "heading": "1. Multi-factor authentication (MFA)", "role": "primary",
+         "quote": "MFA is mandatory for every NakhlaID account"},
+        {"doc_id": "SP-002", "heading": "2. Lost or stolen devices", "role": "primary",
+         "quote": "is a **security incident**"}
+      ]
+    },
+    {
+      "rule_id": "GOV-SP001-PASSWORDS",
+      "kind": "governing_policy",
+      "topic": "password",
+      "anchors": [
+        {"doc_id": "SP-001", "heading": "2. Password resets are self-service only", "role": "primary",
+         "quote": "does not reset passwords"},
+        {"doc_id": "SP-001", "heading": "1. Your password is yours alone", "role": "supporting",
+         "quote": "Never share your NakhlaID password"},
+        {"doc_id": "SP-001", "heading": "3. Account lockout", "role": "supporting",
+         "quote": "Five failed sign-ins within 15 minutes"}
+      ]
+    }
+  ]
+}

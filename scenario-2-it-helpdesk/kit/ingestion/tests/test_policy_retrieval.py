@@ -164,7 +164,8 @@ class HardExclusionTests(unittest.TestCase):
         self.assertTrue(any(d.untrusted_diagnostic_text in poison for d in response.diagnostics))
         self.assertEqual({f.name for f in dataclasses.fields(AnswerView)},
                          {"evidence", "query_codes", "code_coverage", "undocumented_codes", "department",
-                          "requires_department_verification", "sufficiency", "scope_validated", "notes"})
+                          "requires_department_verification", "sufficiency", "scope_validated", "notes",
+                          "department_rules", "governing_policy", "rule_coverage", "rule_index", "rule_warnings"})
 
 
 class ContextOnlyTests(unittest.TestCase):

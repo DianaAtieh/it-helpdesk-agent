@@ -92,6 +92,28 @@ def format_item(item: EvidenceItem, full: bool) -> list[str]:
             f"last_updated={chunk.last_updated}{dept}", f"   {body}"]
 
 
+def format_lane(lane, full: bool = False) -> list[str]:
+    lines = [f"{lane.lane}: coverage={lane.coverage}"
+             + (f" | rules: {', '.join(lane.rule_ids)}" if lane.rule_ids else "")
+             + (" (complete = relative to the validated rule inventory only)" if lane.coverage == "complete" else "")]
+    for item in lane.items:
+        chunk = item.hybrid.chunk
+        marks = [item.role] + (["already in main evidence"] if item.in_main_evidence else []) + (
+            ["REQUIRES DEPARTMENT VERIFICATION"] if item.requires_department_verification else [])
+        lines.append(f"  - [{', '.join(marks)}] {chunk.chunk_id} | {', '.join(item.rule_ids)} | "
+                     f"semantic={item.hybrid.semantic_score:.4f}")
+        lines.append(f"    {chunk.citation}")
+        if not item.in_main_evidence:
+            lines.append("    " + (chunk.text if full else " ".join(chunk.text.split())[:240]))
+    for entry in lane.index:
+        lines.append(f"  - rule index (metadata only): {entry.rule_id} | department {entry.department} | topic "
+                     f"{entry.topic} | " + "; ".join(f"{c} ({cite})" for c, cite in entry.chunks))
+    for omitted in lane.omitted:
+        lines.append(f"  - omitted [{omitted.role}] {omitted.chunk_id}: {omitted.reason}")
+    lines.extend(f"  WARNING: {w}" for w in lane.warnings)
+    return lines
+
+
 def format_policy(response: PolicyResponse, args: argparse.Namespace) -> list[str]:
     s = response.sufficiency
     lines = [f"sufficiency: {s.level} (relevance floor {s.min_semantic_score}; best eligible score "
@@ -117,6 +139,8 @@ def format_policy(response: PolicyResponse, args: argparse.Namespace) -> list[st
     for note in response.conflict_annotations:
         lines.append(f"known conflict {note.id} (diagnostic only): {note.topic} | present: "
                      f"{', '.join(note.present_documents)} | manifest: {note.resolution}")
+    lines.extend(format_lane(response.department_rules))
+    lines.extend(format_lane(response.governing_policy))
     if response.annotation_warning:
         lines.append(f"warning: {response.annotation_warning}")
     if args.diagnostics:

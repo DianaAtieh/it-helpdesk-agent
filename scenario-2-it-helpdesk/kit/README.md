@@ -162,6 +162,14 @@ text and metadata-only `diagnostics` for excluded chunks. Drafts, deprecated and
 never evidence. The department is never inferred; pass `--department`, otherwise department-scoped evidence is
 `conditional` and needs verification. Retrieved text is untrusted data, not instructions.
 
+Rule lanes (Phase 2D): besides `top_k`, policy mode returns two additive lanes, `department_rules` and
+`governing_policy`, selected from the hand-curated, load-time-validated `ingestion/rule_inventory.json` (pointers to
+authoritative chunks; no text, no decisions). Primary anchors are always returned; the budgets (3 and 2) only limit
+supporting anchors, and omissions are listed. Coverage is `complete` (relative to the inventory only), `partial`,
+`department_required` (unknown department: metadata-only index, never inferred), `no_inventory_rule`,
+`topic_not_established` or `unavailable` (inventory failed validation: a warning is raised, never "no exception").
+The Agent/verifier decides what a rule means; the retriever makes no escalation decision.
+
 Known limitations:
 
 - Out-of-scope queries can still retrieve semantically similar authoritative documents (for example, "reset my
