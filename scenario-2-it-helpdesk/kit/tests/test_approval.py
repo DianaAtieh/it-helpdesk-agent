@@ -2,77 +2,18 @@
 
     python -m pytest tests -v
 
-They need the helpdesk API running (uvicorn services.helpdesk_api:app --port 8102) and are
-skipped otherwise. Each test calls the API's test-only /admin/reset, so tickets you created
-by hand on that API are cleared.
+Setup and fixtures: tests/conftest.py (needs the helpdesk API on port 8102).
 """
 from __future__ import annotations
 
-import os
-
-import httpx
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.main import app, get_session, mcp, sessions
-from app.tickets import TicketDraft, TicketDraftError, propose_ticket
+from app.main import get_session
+from app.tickets import TicketDraftError
+from tests.helpers import approve, arm_fault, created_tickets, make_draft, propose, requires_api
 
-API = (os.getenv("HELPDESK_API_URL") or "http://localhost:8102").rstrip("/")
-
-
-def _api_up() -> bool:
-    try:
-        return httpx.get(f"{API}/health", timeout=2).status_code == 200
-    except httpx.HTTPError:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _api_up(), reason=f"helpdesk API not running at {API}")
-
-
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:          # starts the app's lifespan, so the MCP server runs
-        yield c
-
-
-@pytest.fixture(autouse=True)
-def clean():
-    httpx.post(f"{API}/admin/reset", timeout=5).raise_for_status()
-    sessions.clear()
-    yield
-    httpx.delete(f"{API}/admin/faults", timeout=5)
-
-
-def make_draft(**overrides) -> TicketDraft:
-    fields = dict(
-        subject="NX-112 on the VPN since this morning",
-        description="NakhlaConnect shows NX-112 when I connect from home.",
-        category="network_access",
-        priority="P2",
-        requester_email="sara.mikhail@nakhla.example",
-        attempted_steps=["NakhlaManage Sync", "Restarted the laptop"],
-        kb_refs=["KB-002"],
-    )
-    fields.update(overrides)
-    return TicketDraft(**fields)
-
-
-def propose(client: TestClient, session_id: str, draft: TicketDraft):
-    # propose_ticket uses the app's MCP session, so it must run on the app's event loop.
-    action, _ = client.portal.call(propose_ticket, get_session(session_id), draft, mcp)
-    return action
-
-
-def approve(client: TestClient, session_id: str, action_id: str, approved: bool = True) -> dict:
-    r = client.post("/api/approve", json={"session_id": session_id, "action_id": action_id, "approved": approved})
-    assert r.status_code == 200
-    return r.json()
-
-
-def created_tickets() -> list[dict]:
-    return httpx.get(f"{API}/admin/tickets", timeout=5).json()["tickets"]
+pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
 
 # ------------------------------------------------------------- happy path
@@ -132,8 +73,7 @@ def test_double_approval_files_once(client):
 
 
 def test_503_claims_nothing_keeps_the_draft_and_retry_works(client):
-    httpx.post(f"{API}/admin/faults", json={"target": "create_ticket", "mode": "error_503", "count": 1},
-               timeout=5).raise_for_status()
+    arm_fault("create_ticket", "error_503")
     action = propose(client, "s-1", make_draft())
 
     failed = approve(client, "s-1", action.action_id)

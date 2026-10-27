@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 from app.schemas import ToolCall
 
@@ -44,16 +44,24 @@ def _tool_json(result: Any) -> dict:
     return {"ok": False, "error": {"code": "empty_tool_output", "message": "The tool returned nothing."}}
 
 
+def server_env() -> dict[str, str]:
+    """Least privilege: what the OS needs to run Python, plus the HELPDESK_* settings. Nothing else.
+
+    Our other secrets (OPENROUTER_API_KEY, APP_ADMIN_TOKEN, cloud credentials) stay out of the
+    subprocess. Note: when the kit's .env file exists, the MCP server also reads it by itself.
+    """
+    return {**get_default_environment(),
+            **{key: value for key, value in os.environ.items() if key.startswith("HELPDESK_")}}
+
+
 class HelpdeskMCP:
     def __init__(self) -> None:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
 
     async def start(self) -> None:
-        # Pass our environment on: by default the MCP SDK starts the server with a minimal env,
-        # and the server needs HELPDESK_API_URL and HELPDESK_API_KEY.
         params = StdioServerParameters(command=sys.executable, args=["-m", "services.helpdesk_mcp"],
-                                       cwd=str(KIT), env=dict(os.environ))
+                                       cwd=str(KIT), env=server_env())
         self._stack = AsyncExitStack()
         read, write = await self._stack.enter_async_context(stdio_client(params))
         self._session = await self._stack.enter_async_context(ClientSession(read, write))

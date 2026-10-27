@@ -10,17 +10,28 @@ The helpdesk API must be running on port 8102 (uvicorn services.helpdesk_api:app
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import secrets
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
 
-from app.mcp_client import HelpdeskMCP
-from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest
-from app.tickets import ROUTING, TICKET_ID
+# The kit's .env, without overriding variables that are already set (e.g. by Docker).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+
+from app.mcp_client import HelpdeskMCP  # noqa: E402  (after load_dotenv on purpose)
+from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest  # noqa: E402
+from app.tickets import ROUTING, TICKET_ID  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("helpdesk-app")
+
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS") or 1000)
 
 mcp = HelpdeskMCP()
 
@@ -41,12 +52,29 @@ app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifesp
 #   user            {"email": ...} or None
 #   pending_action  the one PendingAction waiting for approval, or None
 #   filed           {action_id: ticket_id} for approvals that already created a ticket (replay protection)
+#   lock            one request per session at a time, so Approve and Reject cannot race
 # Temporary: the LangGraph SQLite checkpointer replaces this dict later.
-sessions: dict[str, dict] = {}
+# Least recently used first; at most MAX_SESSIONS are kept, so new session ids cannot fill the memory.
+sessions: OrderedDict[str, dict] = OrderedDict()
 
 
 def get_session(session_id: str) -> dict:
-    return sessions.setdefault(session_id, {"user": None, "pending_action": None, "filed": {}})
+    session = sessions.get(session_id)
+    if session is None:
+        session = {"user": None, "pending_action": None, "filed": {}, "lock": asyncio.Lock()}
+        sessions[session_id] = session
+        _evict_idle_sessions()
+    sessions.move_to_end(session_id)
+    return session
+
+
+def _evict_idle_sessions() -> None:
+    """Drop the least recently used sessions above MAX_SESSIONS, never one with a request in progress."""
+    for session_id in list(sessions):
+        if len(sessions) <= MAX_SESSIONS:
+            break
+        if not sessions[session_id]["lock"].locked():
+            del sessions[session_id]
 
 
 def ticket_failure_reply(error: dict) -> tuple[str, bool]:
@@ -89,7 +117,22 @@ def health() -> dict:
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session = get_session(req.session_id)
-    if req.user:
+    async with session["lock"]:
+        return await _chat(req, session)
+
+
+async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
+    # Without a login the email is a claim, but a conversation cannot switch to another employee
+    # (e.g. to a VIP for a P1 ticket) once it started.
+    current = (session["user"] or {}).get("email")
+    if req.user and current and req.user.email != current:
+        log.warning("chat session=%s refused: user changed from %s to %s", req.session_id, current, req.user.email)
+        return ChatResponse(
+            session_id=req.session_id,
+            reply="This conversation is already linked to another employee. Please start a new conversation.",
+            state="identity_mismatch",
+        )
+    if req.user and not current:
         session["user"] = req.user.model_dump()
     log.info("chat session=%s user=%s", req.session_id, (session["user"] or {}).get("email"))
 
@@ -105,16 +148,26 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 @app.post("/api/approve", response_model=ChatResponse)
 async def approve(req: ApproveRequest) -> ChatResponse:
-    """The approval gate: the only place in the app that writes a ticket."""
-    session = get_session(req.session_id)
+    """The approval gate: the only place in the app that writes a ticket.
 
+    The session lock makes Approve, Reject and chat turns of one session run one after another:
+    without it, a Reject arriving while create_ticket is in flight said "not filed" for a filed ticket.
+    """
+    session = get_session(req.session_id)
+    async with session["lock"]:
+        return await _approve(req, session)
+
+
+async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
     # Replay of an approval that already created a ticket (double click): never write twice.
     already = session["filed"].get(req.action_id)
     if already:
         log.info("approve replay session=%s action=%s ticket=%s", req.session_id, req.action_id, already)
+        reply = (f"This ticket was already filed as {already}. I did not file it again." if req.approved else
+                 f"This ticket was already filed as {already}, so it can no longer be rejected.")
         return ChatResponse(
             session_id=req.session_id,
-            reply=f"This ticket was already filed as {already}. I did not file it again.",
+            reply=reply,
             state="ticket_created",
             result={"ticket_id": already},
         )
@@ -171,11 +224,24 @@ async def approve(req: ApproveRequest) -> ChatResponse:
 
 
 @app.post("/reset")
-def reset(req: ResetRequest | None = None) -> dict:
-    """Clear our app's session state. Never touches the knowledge base or the helpdesk API."""
+async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Header(default=None)) -> dict:
+    """Clear our app's session state. Never touches the knowledge base or the helpdesk API.
+
+    One session: open to anyone who knows its id. Every session: needs the X-Admin-Token header
+    to match APP_ADMIN_TOKEN, and is disabled when APP_ADMIN_TOKEN is not set.
+    """
     if req and req.session_id:
-        sessions.pop(req.session_id, None)
+        session = sessions.get(req.session_id)
+        if session is not None:
+            async with session["lock"]:          # wait for a request of this session to finish
+                sessions.pop(req.session_id, None)
         return {"status": "ok", "reset": req.session_id}
+
+    expected = os.getenv("APP_ADMIN_TOKEN") or ""
+    if not expected or not secrets.compare_digest(x_admin_token or "", expected):
+        log.warning("reset of all sessions refused (missing or wrong admin token)")
+        raise HTTPException(status_code=403, detail="Resetting every session needs a valid X-Admin-Token.")
     count = len(sessions)
     sessions.clear()
+    log.info("reset all sessions: %d cleared", count)
     return {"status": "ok", "reset": "all", "sessions_cleared": count}

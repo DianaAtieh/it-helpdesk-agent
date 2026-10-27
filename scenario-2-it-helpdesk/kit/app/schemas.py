@@ -5,31 +5,40 @@ tests read them. Do not rename them.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Size limits keep one request from costing real money (LLM tokens) or memory.
+SessionId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")]
+MAX_MESSAGE_CHARS = 4000
 
 
 # ---------------------------------------------------------------- requests
 
 class User(BaseModel):
-    email: str
+    email: str = Field(min_length=3, max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def normalise(cls, value: str) -> str:
+        return value.strip().lower()
 
 
 class ChatRequest(BaseModel):
-    session_id: str
-    message: str
+    session_id: SessionId
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     user: User | None = None          # optional: sample case S2-02 sends no user
 
 
 class ApproveRequest(BaseModel):
-    session_id: str
-    action_id: str
+    session_id: SessionId
+    action_id: str = Field(min_length=1, max_length=64)
     approved: bool
 
 
 class ResetRequest(BaseModel):
-    session_id: str | None = None     # None = reset every session
+    session_id: SessionId | None = None     # None = reset every session (needs the admin token)
 
 
 # ---------------------------------------------------------------- response
