@@ -122,6 +122,55 @@ The knowledge base is **not** an MCP tool: ingestion, chunking, embeddings and r
 `dataset/knowledge_base/` (Markdown and PDF) are yours to build, for example OpenRouter
 `openai/text-embedding-3-small` with a numpy cosine store, or Chroma.
 
+## Offline RAG pipeline (`ingestion/`)
+
+Status: loading, chunking, embeddings, the SQLite index and retrieval (semantic, hybrid exact-error-code,
+policy-aware) are implemented. **The agent, the downstream answer verifier, MCP integration, memory and the UI
+wiring are not implemented yet.**
+
+Run everything from the kit folder, in PowerShell, with the kit venv:
+
+```powershell
+cd scenario-2-it-helpdesk\kit
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env        # set OPENROUTER_API_KEY in .env; never commit it
+
+# Offline tests (no network, no API key needed)
+python -m unittest discover -s ingestion/tests -t .
+python dataset/validate_dataset.py
+
+# Build the index: 20 documents, 117 chunks, 1536-dim vectors -> ingestion/index.db (gitignored)
+python -m ingestion.build_index --dry-run                # no API calls, no writes
+python -m ingestion.build_index                          # real build via OpenRouter (needs the key)
+python -m ingestion.build_index --verify                 # offline integrity check
+python -m ingestion.build_index --provider fake          # offline fake index (index.fake.db), for experiments
+
+# Retrieve (embeds the query via OpenRouter; the index is opened read-only)
+python -m ingestion.search "My VPN keeps disconnecting" --top-k 5 --department Finance
+python -m ingestion.search "NX-781" --diagnostics --annotate-conflicts
+python -m ingestion.search "..." --mode hybrid           # or --mode semantic; default is --mode policy
+```
+
+Rebuilding is idempotent: unchanged documents are skipped with no embedding requests. The index is pinned to its
+embedding model; change `EMBEDDING_MODEL` only together with a rebuild. The `.db` file is generated, so it is
+not in Git: each teammate builds their own (about 117 embedding inputs, a few cents).
+
+Policy mode returns `actionable` and `conditional` evidence (shared `top_k`), capped `context_only` background
+text and metadata-only `diagnostics` for excluded chunks. Drafts, deprecated and superseded documents are
+never evidence. The department is never inferred; pass `--department`, otherwise department-scoped evidence is
+`conditional` and needs verification. Retrieved text is untrusted data, not instructions.
+
+Known limitations:
+
+- Out-of-scope queries can still retrieve semantically similar authoritative documents (for example, "reset my
+  Netflix password" matches the password KB); the `0.25` relevance floor only rejects clearly unrelated queries.
+- Same-point SP-vs-KB conflicts are not resolved by retrieval; the downstream verifier must apply
+  "SP overrides KB". Manifest conflicts are attached as diagnostics only (`--annotate-conflicts`).
+- Sufficiency means eligible, relevant-scoring evidence exists. It does not guarantee that the evidence
+  resolves the user's problem, and a "documented" error code is not a confirmed fix.
+
 ## The approval gate
 
 Keep `create_ticket` (and `add_ticket_note`) **out of the model's tool list**. The model drafts a
