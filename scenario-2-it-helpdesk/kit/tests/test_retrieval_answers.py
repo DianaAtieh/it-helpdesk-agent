@@ -61,10 +61,6 @@ def answer_docs(view) -> set[str]:
     return {e.doc_id for e in view.evidence}
 
 
-def answer_sections(view) -> set[tuple[str, str]]:
-    return {(e.doc_id, e.heading_path[-1]) for e in view.evidence}
-
-
 # ------------------------------------------------------------- the index itself (offline)
 
 def test_index_matches_the_dataset_on_disk():
@@ -129,13 +125,25 @@ def test_c4_no_phone_backup_codes_not_sms(retriever):
     assert "KB-017" not in answer_docs(view)
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: for Finance the KB-002 'Exceptions' section and the KB-016 matrix "
-                                       "(go straight to Security Operations, no client troubleshooting) are not "
-                                       "in the top 5; the agent would get client-troubleshooting steps instead")
-def test_c5_finance_vpn_exception_is_in_the_evidence(retriever):
+def test_c5_finance_vpn_exception_is_in_the_department_rules(retriever):
+    # The exception comes in its own lane (ingestion/rule_lanes.py), not in the top_k evidence.
     _, view = search(retriever, "NakhlaConnect shows NX-403 when I connect from home", "Finance")
-    sections = answer_sections(view)
-    assert ("KB-002", "Exceptions") in sections or ("KB-016", "Matrix") in sections
+    rules = {(r.doc_id, r.heading_path[-1]) for r in view.department_rules}
+    assert {("KB-002", "Exceptions"), ("KB-016", "Matrix")} <= rules
+    assert view.rule_coverage["department_rules"] == "complete"
+    assert all(r.status == "current" and r.authoritative for r in view.department_rules)
+
+
+def test_the_finance_vpn_exception_does_not_leak_into_other_topics(retriever):
+    _, view = search(retriever, "Printer shows PRN-21", "Finance")
+    assert not any(r.doc_id == "KB-002" for r in view.department_rules)
+
+
+def test_unknown_department_asks_for_it_instead_of_guessing_the_exception(retriever):
+    _, view = search(retriever, "NakhlaConnect shows NX-403 when I connect from home")
+    assert view.department_rules == ()
+    assert view.rule_coverage["department_rules"] == "department_required"
+    assert view.requires_department_verification
 
 
 # ------------------------------------------------------------- department rules (rule 4)
