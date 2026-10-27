@@ -12,7 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, sessions
+from app.main import app, delete_all_threads, sessions
 from tests.helpers import API
 
 
@@ -36,8 +36,14 @@ def client(checkpoint_db):
 
 
 @pytest.fixture
-def clean():
+def clean(client):
+    """Every test starts fresh: helpdesk API seed data, no in-memory sessions, no saved conversations.
+
+    Deleting the checkpoint threads matters: test files reuse session ids such as "s-1", and a thread
+    left by an earlier test would carry its history and its locked user_email into the next one.
+    """
     httpx.post(f"{API}/admin/reset", timeout=5).raise_for_status()
     sessions.clear()
+    client.portal.call(delete_all_threads, app.state.checkpointer)
     yield
     httpx.delete(f"{API}/admin/faults", timeout=5)

@@ -256,18 +256,40 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
     )
 
 
+async def delete_all_threads(checkpointer: AsyncSqliteSaver) -> int:
+    """Delete every saved conversation in the checkpoint database, not only the ones still in memory.
+
+    alist(None) lists the checkpoints of every thread (public API). Returns how many threads were deleted.
+    """
+    thread_ids = {c.config["configurable"]["thread_id"] async for c in checkpointer.alist(None)}
+    for thread_id in thread_ids:
+        await checkpointer.adelete_thread(thread_id)
+    return len(thread_ids)
+
+
 @app.post("/reset")
 async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Header(default=None)) -> dict:
-    """Clear our app's session state. Never touches the knowledge base or the helpdesk API.
+    """Clear our app's session state and saved conversations. Never touches the knowledge base or the helpdesk API.
 
-    One session: open to anyone who knows its id. Every session: needs the X-Admin-Token header
-    to match APP_ADMIN_TOKEN, and is disabled when APP_ADMIN_TOKEN is not set.
+    One session: open to anyone who knows its id. Its in-memory state and its checkpoint thread (messages,
+    user_email) are deleted, so the same session id starts fresh, even for another employee.
+    Every session: needs the X-Admin-Token header to match APP_ADMIN_TOKEN, and is disabled when
+    APP_ADMIN_TOKEN is not set. It deletes every thread in the checkpoint database, including ones no longer
+    in memory (after an eviction or a restart). Limitation: it does not wait for requests already in progress;
+    a turn that finishes after the reset saves its checkpoint again.
     """
+    checkpointer = app.state.checkpointer
     if req and req.session_id:
-        session = sessions.get(req.session_id)
-        if session is not None:
-            async with session["lock"]:          # wait for a request of this session to finish
-                sessions.pop(req.session_id, None)
+        # get_session also covers a session that is only on disk: its lock then guards the deletion too.
+        session = get_session(req.session_id)
+        async with session["lock"]:              # wait for a request of this session to finish
+            try:
+                await checkpointer.adelete_thread(req.session_id)
+            except Exception:
+                log.exception("reset session=%s: could not delete the saved conversation", req.session_id)
+                raise HTTPException(status_code=500, detail="The saved conversation could not be deleted.")
+            sessions.pop(req.session_id, None)
+        log.info("reset session=%s (in-memory state and saved conversation deleted)", req.session_id)
         return {"status": "ok", "reset": req.session_id}
 
     expected = os.getenv("APP_ADMIN_TOKEN") or ""
@@ -275,6 +297,11 @@ async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Hea
         log.warning("reset of all sessions refused (missing or wrong admin token)")
         raise HTTPException(status_code=403, detail="Resetting every session needs a valid X-Admin-Token.")
     count = len(sessions)
+    try:
+        threads = await delete_all_threads(checkpointer)
+    except Exception:
+        log.exception("reset all: could not delete the saved conversations")
+        raise HTTPException(status_code=500, detail="The saved conversations could not be deleted.")
     sessions.clear()
-    log.info("reset all sessions: %d cleared", count)
-    return {"status": "ok", "reset": "all", "sessions_cleared": count}
+    log.info("reset all sessions: %d in memory cleared, %d saved conversations deleted", count, threads)
+    return {"status": "ok", "reset": "all", "sessions_cleared": count, "threads_deleted": threads}
