@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from app.mcp_client import HelpdeskMCP
 from app.schemas import ApproveRequest, ChatRequest, ChatResponse, ResetRequest
+from app.tickets import ROUTING, TICKET_ID
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("helpdesk-app")
@@ -36,13 +37,30 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifespan)
 
-# Session state, keyed by session_id: {"user": {...} | None, "pending_action": PendingAction | None}.
+# Session state, keyed by session_id:
+#   user            {"email": ...} or None
+#   pending_action  the one PendingAction waiting for approval, or None
+#   filed           {action_id: ticket_id} for approvals that already created a ticket (replay protection)
 # Temporary: the LangGraph SQLite checkpointer replaces this dict later.
 sessions: dict[str, dict] = {}
 
 
 def get_session(session_id: str) -> dict:
-    return sessions.setdefault(session_id, {"user": None, "pending_action": None})
+    return sessions.setdefault(session_id, {"user": None, "pending_action": None, "filed": {}})
+
+
+def ticket_failure_reply(error: dict) -> tuple[str, bool]:
+    """An honest reply for a failed create_ticket, and whether the same draft may be retried."""
+    code = error.get("code")
+    if code == "timeout":
+        # A timeout confirms nothing either way; retrying is safe thanks to the idempotency key.
+        return ("I couldn't confirm that the ticket was created: the ticket system did not answer in time. "
+                "You can approve again. It is safe and will not create a duplicate."), True
+    if code == "validation_error":
+        return ("The ticket was not created: the ticket system rejected the draft. Nothing was filed. "
+                "Tell me more about the problem and I will prepare a corrected draft."), False
+    return ("The ticket was not created: the ticket system is unavailable right now. Nothing was filed. "
+            "You can approve again in a moment to retry."), True
 
 
 def describe_status(data: dict) -> str:
@@ -86,11 +104,23 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 
 @app.post("/api/approve", response_model=ChatResponse)
-def approve(req: ApproveRequest) -> ChatResponse:
+async def approve(req: ApproveRequest) -> ChatResponse:
+    """The approval gate: the only place in the app that writes a ticket."""
     session = get_session(req.session_id)
-    pending = session["pending_action"]
 
-    # Unknown, already used, or belongs to another draft: write nothing.
+    # Replay of an approval that already created a ticket (double click): never write twice.
+    already = session["filed"].get(req.action_id)
+    if already:
+        log.info("approve replay session=%s action=%s ticket=%s", req.session_id, req.action_id, already)
+        return ChatResponse(
+            session_id=req.session_id,
+            reply=f"This ticket was already filed as {already}. I did not file it again.",
+            state="ticket_created",
+            result={"ticket_id": already},
+        )
+
+    # Unknown, stale (replaced by a newer draft) or from another session: write nothing.
+    pending = session["pending_action"]
     if pending is None or pending.action_id != req.action_id:
         log.info("approve ignored session=%s action=%s (no matching pending action)",
                  req.session_id, req.action_id)
@@ -99,22 +129,44 @@ def approve(req: ApproveRequest) -> ChatResponse:
             reply="There is no ticket draft waiting for approval, so nothing was filed.",
         )
 
-    # The action is used up either way, so a replayed approval cannot write twice.
-    session["pending_action"] = None
-
     if not req.approved:
+        session["pending_action"] = None
         log.info("approve rejected session=%s action=%s", req.session_id, req.action_id)
         return ChatResponse(
             session_id=req.session_id,
             reply="Okay, I did not file the ticket. Tell me if you want to change anything.",
         )
 
-    # Step 6 (approval gate) calls create_ticket over MCP here, with idempotency_key = action_id.
-    log.info("approve accepted session=%s action=%s (ticket creation not connected yet)",
-             req.session_id, req.action_id)
+    # Exactly the approved payload, with the action id as the idempotency key.
+    data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id})
+    ticket_id = str((data.get("ticket") or {}).get("ticket_id", "")) if data.get("ok") else ""
+
+    if data.get("ok") and TICKET_ID.fullmatch(ticket_id):
+        session["pending_action"] = None
+        session["filed"][pending.action_id] = ticket_id
+        team = data["ticket"].get("assigned_team") or ROUTING.get(pending.payload["category"], "IT")
+        log.info("ticket created session=%s action=%s ticket=%s", req.session_id, pending.action_id, ticket_id)
+        return ChatResponse(
+            session_id=req.session_id,
+            reply=f"Done. Your ticket is {ticket_id}. {team} will contact you.",
+            state="ticket_created",
+            result={"ticket_id": ticket_id, "assigned_team": team},
+            tool_calls=[call],
+        )
+
+    # Failed, or an answer without a valid ticket id: claim nothing.
+    error = data.get("error") or {"code": "bad_tool_output"}
+    reply, can_retry = ticket_failure_reply(error)
+    if not can_retry:
+        session["pending_action"] = None
+    log.warning("ticket not created session=%s action=%s error=%s", req.session_id, pending.action_id,
+                error.get("code"))
     return ChatResponse(
         session_id=req.session_id,
-        reply="Approval received, but ticket creation is not connected yet. No ticket was filed.",
+        reply=reply,
+        state="await_approval" if can_retry else "ticket_failed",
+        pending_action=pending if can_retry else None,
+        tool_calls=[call],
     )
 
 

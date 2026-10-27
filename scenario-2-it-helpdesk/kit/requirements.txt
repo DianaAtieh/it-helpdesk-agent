@@ -28,3 +28,5 @@ numpy==2.5.4
 # (chat + embeddings). evals/run_evals.py --judge also uses openai.
 langgraph==1.2.10
 openai==2.52.0
+# Tests
+pytest==8.4.2
