@@ -16,6 +16,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent.graph import build_graph
 from app.agent.nodes import describe_status
+from app.main import DEFAULT_CHECKPOINT_DB
 from app.schemas import ToolCall
 
 INC_2207 = {"id": "INC-2207", "status": "active", "priority": "P1", "service": "vpn",
@@ -131,3 +132,52 @@ def test_the_state_round_trips_through_the_sqlite_saver_without_serializer_warni
     assert values["tool_calls"] == [{"tool": "get_service_status", "ok": True, "ms": 7}]
     assert values["active_incident"] == INC_2207
     assert not [r.getMessage() for r in caplog.records if r.name.startswith("langgraph")]
+
+
+def test_a_conversation_survives_closing_and_reopening_the_sqlite_database(tmp_path):
+    db = tmp_path / "restart.db"
+    assert db.resolve() != DEFAULT_CHECKPOINT_DB.resolve()          # never the real development database
+    email = "sara.mikhail@nakhla.example"
+
+    async def first_run() -> dict:
+        async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:
+            await checkpointer.setup()
+            graph = build_graph(checkpointer, FakeMCP(STATUS_OK))
+            await graph.ainvoke({"messages": [HumanMessage(content="Is the VPN down?")], "user_email": email},
+                                config("t-1"))
+            await graph.ainvoke({"messages": [HumanMessage(content="And now?")]}, config("t-1"))
+            return (await graph.aget_state(config("t-1"))).values
+        # leaving the block closes the connection, as the app's lifespan does on shutdown
+
+    async def after_restart() -> tuple[dict, dict]:
+        async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpointer:   # a brand-new saver
+            await checkpointer.setup()
+            graph = build_graph(checkpointer, FakeMCP(STATUS_DOWN))
+            restored = (await graph.aget_state(config("t-1"))).values         # read BEFORE any new turn
+            await graph.ainvoke({"messages": [HumanMessage(content="Third message")]}, config("t-1"))
+            return restored, (await graph.aget_state(config("t-1"))).values
+
+    try:
+        before = asyncio.run(first_run())
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["restart.db"]   # clean close: no -wal / -shm left
+
+        restored, continued = asyncio.run(after_restart())
+
+        # Everything saved before the restart comes back exactly.
+        assert [(type(m), m.content) for m in restored["messages"]] == \
+               [(type(m), m.content) for m in before["messages"]]
+        assert [m.content for m in restored["messages"]][::2] == ["Is the VPN down?", "And now?"]
+        assert restored["user_email"] == email
+        assert restored["active_incident"] == INC_2207
+        assert restored["reply"] == before["reply"] == describe_status(STATUS_OK)
+        assert restored["tool_calls"] == [{"tool": "get_service_status", "ok": True, "ms": 7}]
+
+        # The conversation continues on top of the restored history.
+        assert len(continued["messages"]) == 6
+        assert continued["messages"][4].content == "Third message"
+        assert continued["user_email"] == email                       # kept from before the restart
+        assert continued["active_incident"] is None                   # refreshed this turn (status page down)
+    finally:
+        for path in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            path.unlink(missing_ok=True)
+    assert not db.exists()
