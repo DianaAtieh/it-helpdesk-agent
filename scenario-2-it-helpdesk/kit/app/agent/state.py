@@ -27,3 +27,7 @@ class AgentState(TypedDict, total=False):
     # PendingAction dict, and {action_id: ticket_id} for drafts that already became tickets.
     pending_action: dict | None
     filed: dict[str, str]
+    # Who may approve (also written by app/main.py, never by a node): the sha256 of the session token
+    # issued on the conversation's first turn, and when it was issued (ISO time). Never the token itself.
+    token_hash: str
+    token_issued_at: str

@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import secrets
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage, RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -95,6 +98,9 @@ app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifesp
 #   loaded          True once the saved values were read back from the checkpoint
 #   lock            one request per session at a time, so Approve and Reject cannot race
 #   waiting         how many requests are waiting for the lock (see session_turn)
+#   stored          True if the conversation had a checkpoint when it was loaded
+#   token_hash      sha256 of the session token, or None                 (saved as token_hash)
+#   token_issued_at ISO time the token was issued                        (saved as token_issued_at)
 # Least recently used first; at most MAX_SESSIONS are kept, so new session ids cannot fill the memory.
 # An evicted session loses nothing: load_session() reads it back from the checkpoint.
 sessions: OrderedDict[str, dict] = OrderedDict()
@@ -139,7 +145,7 @@ def get_session(session_id: str) -> dict:
     session = sessions.get(session_id)
     if session is None:
         session = {"user": None, "pending_action": None, "filed": {}, "loaded": False, "lock": asyncio.Lock(),
-                   "waiting": 0}
+                   "waiting": 0, "stored": False, "token_hash": None, "token_issued_at": None}
         sessions[session_id] = session
         _evict_idle_sessions(keep=session_id)
     sessions.move_to_end(session_id)
@@ -156,6 +162,9 @@ async def load_session(session_id: str, session: dict) -> None:
     if saved.get("pending_action"):
         session["pending_action"] = PendingAction(**saved["pending_action"])
     session["filed"] = dict(saved.get("filed") or {})
+    session["token_hash"] = saved.get("token_hash")
+    session["token_issued_at"] = saved.get("token_issued_at")
+    session["stored"] = bool(saved)
     session["loaded"] = True
 
 
@@ -166,6 +175,7 @@ async def save_approval_state(session_id: str, session: dict) -> None:
         "pending_action": pending.model_dump() if pending else None,   # plain dict: checkpoint-safe
         "filed": dict(session["filed"]),
     }, as_node=FINAL_NODE)
+    session["stored"] = True          # it has a checkpoint now: never issue it a token later
     await prune_thread(app.state.checkpointer, session_id)
 
 
@@ -237,6 +247,104 @@ def ticket_failure_reply(error: dict) -> tuple[str, bool]:
             "You can approve again in a moment to retry."), True
 
 
+# ---------------------------------------------------------------- session token (who may approve)
+# A session id names a conversation; it does not prove who is asking (and an email is only a claim). So the
+# first /api/chat of a NEW conversation issues a random token to that client, and /api/approve (approve AND
+# reject) and /reset of that conversation require it. The server keeps only its sha256 in the checkpoint.
+# The client gets it two ways, and sends it back either way (the header wins when both are present):
+#   * an HttpOnly cookie, so clients that keep cookies (httpx.Client, as in evals/run_evals.py) need no change;
+#   * the X-Session-Token response header, for clients that keep it themselves (the Gradio UI).
+# Never in a URL, a response body or a log. The course's JSON contract is unchanged.
+SESSION_TOKEN_HEADER = "X-Session-Token"
+
+
+def session_token_ttl_seconds() -> int:
+    """How long a token may approve, from when it was issued. After that: start a new conversation."""
+    return int(os.getenv("SESSION_TOKEN_TTL_SECONDS") or 24 * 3600)
+
+
+def session_cookie_secure() -> bool:
+    """Set SESSION_COOKIE_SECURE=true behind HTTPS. Off by default: a Secure cookie is never sent over plain
+    http, which the local app, the tests and the eval runner use."""
+    return (os.getenv("SESSION_COOKIE_SECURE") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def session_cookie_name(session_id: str) -> str:
+    """One cookie per conversation, so several sessions in one cookie jar never overwrite each other."""
+    return "hd_session_" + hashlib.sha256(session_id.encode()).hexdigest()[:16]
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def presented_token(request: Request, session_id: str) -> str | None:
+    """The token the client sent: the X-Session-Token header if present, otherwise this session's cookie."""
+    return request.headers.get(SESSION_TOKEN_HEADER) or request.cookies.get(session_cookie_name(session_id))
+
+
+def token_problem(session: dict, presented: str | None) -> str | None:
+    """None if `presented` is this session's token and still valid; otherwise "missing", "invalid" or "expired".
+
+    Expiry is only reported to a client that holds the right token."""
+    if not presented:
+        return "missing"
+    stored = session["token_hash"]
+    if not stored or not hmac.compare_digest(hash_token(presented), stored):
+        return "invalid"
+    issued = datetime.fromisoformat(session["token_issued_at"])
+    if datetime.now(timezone.utc) - issued > timedelta(seconds=session_token_ttl_seconds()):
+        return "expired"
+    return None
+
+
+def new_session_token() -> tuple[str, dict]:
+    """A fresh token and the state fields that store it (its hash and the time it was issued)."""
+    token = secrets.token_urlsafe(32)
+    return token, {"token_hash": hash_token(token), "token_issued_at": datetime.now(timezone.utc).isoformat()}
+
+
+def send_session_token(response: Response, session_id: str, token: str) -> None:
+    response.headers[SESSION_TOKEN_HEADER] = token
+    response.headers["Cache-Control"] = "no-store"
+    response.set_cookie(session_cookie_name(session_id), token, max_age=session_token_ttl_seconds(),
+                        httponly=True, samesite="strict", secure=session_cookie_secure(), path="/")
+
+
+async def issue_session_token(session_id: str) -> str | None:
+    """Give a NEW conversation (no checkpoint, no token) its token and save the hash. None if it already has
+    a checkpoint: a token is never issued twice, or anyone who knows the session id could get one.
+
+    /api/chat issues tokens inside the turn; this is for paths that start a conversation without a chat turn
+    (the tests' propose helper). Call under the session's lock.
+    """
+    session = get_session(session_id)
+    await load_session(session_id, session)
+    if session["token_hash"] or session["stored"]:
+        return None
+    token, fields = new_session_token()
+    await app.state.graph.aupdate_state(thread_config(session_id), fields, as_node=FINAL_NODE)
+    await prune_thread(app.state.checkpointer, session_id)
+    session.update(fields, stored=True)
+    return token
+
+
+UNAUTHORIZED_REPLY = {
+    "missing": "This conversation's approval key was not sent, so I did not act on this request. Nothing was changed.",
+    "invalid": "This approval key does not belong to this conversation, so I did not act on it. Nothing was changed.",
+    "expired": ("The approval key of this conversation has expired, so I did not act on it. Nothing was changed. "
+                "Please start a new conversation and ask for the ticket again."),
+}
+
+
+class Unauthorized(Exception):
+    """The request did not carry this conversation's valid session token."""
+
+    def __init__(self, problem: str):
+        super().__init__(problem)
+        self.problem = problem
+
+
 def thread_config(session_id: str) -> dict:
     """The LangGraph config for one conversation: its checkpoints are stored under this thread id."""
     return {"configurable": {"thread_id": session_id}}
@@ -248,11 +356,11 @@ def health() -> dict:
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest, response: Response) -> ChatResponse:
     session = get_session(req.session_id)
     try:
         async with session_turn(session):
-            return await _chat(req, session)
+            return await _chat(req, session, response)
     except SessionBusy:
         log.info("chat session=%s busy: an earlier request is still running", session_ref(req.session_id))
         return ChatResponse(
@@ -271,7 +379,7 @@ def agent_error_reply(session_id: str) -> ChatResponse:
     )
 
 
-async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
+async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResponse:
     graph = app.state.graph
     config = thread_config(req.session_id)
 
@@ -324,6 +432,11 @@ async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
     turn: dict = {"messages": [human]}
     if email:
         turn["user_email"] = email
+    # A new conversation gets its token in this turn: saved with the turn, sent only if the turn succeeds.
+    new_token, token_fields = None, {}
+    if not session["token_hash"] and not session["stored"]:
+        new_token, token_fields = new_session_token()
+        turn.update(token_fields)
     try:
         out = await graph.ainvoke(turn, config)
         # Instructions aimed at the assistant are answered this turn only, never replayed from the history (V4).
@@ -338,6 +451,10 @@ async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
     except Exception:  # the checkpoint database or a node failed: reply honestly, never a 500
         log.exception("chat session=%s: the agent failed", session_ref(req.session_id))
         return agent_error_reply(req.session_id)
+    session["stored"] = True
+    if new_token:
+        session.update(token_fields)
+        send_session_token(response, req.session_id, new_token)
     return ChatResponse(
         session_id=req.session_id,
         reply=f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"],
@@ -347,16 +464,23 @@ async def _chat(req: ChatRequest, session: dict) -> ChatResponse:
 
 
 @app.post("/api/approve", response_model=ChatResponse)
-async def approve(req: ApproveRequest) -> ChatResponse:
+async def approve(req: ApproveRequest, request: Request) -> ChatResponse:
     """The approval gate: the only place in the app that writes a ticket.
 
     The session lock makes Approve, Reject and chat turns of one session run one after another:
     without it, a Reject arriving while create_ticket is in flight said "not filed" for a filed ticket.
+    Approve and reject both need the conversation's session token (header or cookie); without a valid one
+    the answer is HTTP 403 and nothing is changed or written.
     """
     session = get_session(req.session_id)
     try:
         async with session_turn(session):
-            return await _approve(req, session)
+            return await _approve(req, session, presented_token(request, req.session_id))
+    except Unauthorized as refused:
+        log.warning("approve session=%s refused: %s session token", session_ref(req.session_id), refused.problem)
+        body = ChatResponse(session_id=req.session_id, reply=UNAUTHORIZED_REPLY[refused.problem],
+                            state="unauthorized")
+        return JSONResponse(status_code=403, content=body.model_dump())
     except SessionBusy:
         log.info("approve session=%s busy: an earlier request is still running", session_ref(req.session_id))
         return ChatResponse(
@@ -375,7 +499,7 @@ async def _save_or_log(session_id: str, session: dict) -> None:
         log.exception("approve session=%s: could not save the approval state", session_ref(session_id))
 
 
-async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
+async def _approve(req: ApproveRequest, session: dict, token: str | None) -> ChatResponse:
     # After a restart or an eviction, the draft and the filed record come back from the checkpoint.
     try:
         await load_session(req.session_id, session)
@@ -386,6 +510,12 @@ async def _approve(req: ApproveRequest, session: dict) -> ChatResponse:
             reply="I could not check the ticket draft right now, so nothing was filed. Please try again in a moment.",
             state="error",
         )
+
+    # Only the client that holds this conversation's token may approve or reject, or learn a ticket id.
+    # Checked before anything else: a refused request changes no state and calls no tool.
+    problem = token_problem(session, token)
+    if problem:
+        raise Unauthorized(problem)
 
     # Replay of an approval that already created a ticket (double click): never write twice.
     already = session["filed"].get(req.action_id)
@@ -473,13 +603,15 @@ def admin_token_ok(token: str | None) -> bool:
 
 
 @app.post("/reset")
-async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Header(default=None)) -> dict:
+async def reset(request: Request, response: Response, req: ResetRequest | None = None,
+                x_admin_token: str | None = Header(default=None)) -> dict:
     """Clear our app's session state and saved conversations. Never touches the knowledge base or the helpdesk API.
 
-    One session: its in-memory state and its checkpoint thread (messages, user_email) are deleted, so the same
-    session id starts fresh, even for another employee. A conversation linked to an employee can only be reset
-    with that employee's email in "user" (the same rule as /api/chat) or with the admin token (V11); an
-    anonymous one by anyone who knows its id, who could continue it anyway.
+    One session: its in-memory state and its checkpoint thread (messages, user_email, token) are deleted, so the
+    same session id starts fresh, even for another employee. A conversation with a session token can only be
+    reset with that token (header or cookie; an expired one still proves it is yours) or with the admin token.
+    Older conversations without a token keep the V11 rule: the linked employee's email in "user", or the admin
+    token; an anonymous one by anyone who knows its id.
     Every session: needs the X-Admin-Token header to match APP_ADMIN_TOKEN, and is disabled when
     APP_ADMIN_TOKEN is not set. It deletes every thread in the checkpoint database, including ones no longer
     in memory (after an eviction or a restart). Limitation: it does not wait for requests already in progress;
@@ -491,10 +623,11 @@ async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Hea
         session = get_session(req.session_id)
         try:
             async with session_turn(session):        # wait (a limited time) for a request of this session
-                await _reset_one(req, session, x_admin_token)
+                await _reset_one(req, session, x_admin_token, presented_token(request, req.session_id))
         except SessionBusy:
             raise HTTPException(status_code=409, detail="This conversation is busy. Try the reset again in a moment.")
         log.info("reset session=%s (in-memory state and saved conversation deleted)", session_ref(req.session_id))
+        response.delete_cookie(session_cookie_name(req.session_id), path="/")
         return {"status": "ok", "reset": req.session_id}
 
     if not admin_token_ok(x_admin_token):
@@ -511,7 +644,7 @@ async def reset(req: ResetRequest | None = None, x_admin_token: str | None = Hea
     return {"status": "ok", "reset": "all", "sessions_cleared": count, "threads_deleted": threads}
 
 
-async def _reset_one(req: ResetRequest, session: dict, x_admin_token: str | None) -> None:
+async def _reset_one(req: ResetRequest, session: dict, x_admin_token: str | None, token: str | None) -> None:
     """Delete one conversation, if the caller may. Call under the session's lock. Raises HTTPException otherwise."""
     try:
         await load_session(req.session_id, session)  # the linked email may be only on disk
@@ -519,8 +652,14 @@ async def _reset_one(req: ResetRequest, session: dict, x_admin_token: str | None
         log.exception("reset session=%s: could not load the saved conversation", session_ref(req.session_id))
         raise HTTPException(status_code=500,
                             detail="The saved conversation could not be checked, so nothing was deleted.")
+    if session["token_hash"]:
+        if not admin_token_ok(x_admin_token) and token_problem(session, token) not in (None, "expired"):
+            log.warning("reset session=%s refused: no valid session token", session_ref(req.session_id))
+            raise HTTPException(status_code=403,
+                                detail="Resetting this conversation needs its session token (or the admin token).")
     linked = (session["user"] or {}).get("email")
-    if linked and not (req.user and req.user.email == linked) and not admin_token_ok(x_admin_token):
+    if (not session["token_hash"] and linked and not (req.user and req.user.email == linked)
+            and not admin_token_ok(x_admin_token)):
         log.warning("reset session=%s refused: the request does not name the linked employee",
                     session_ref(req.session_id))
         raise HTTPException(status_code=403,

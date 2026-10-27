@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.main import app, sessions, thread_config
-from tests.helpers import approve, make_draft, propose, requires_api
+from tests.helpers import approve, created_tickets, make_draft, propose, requires_api, token_headers
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -35,7 +35,7 @@ def reset_one(client, session_id: str, user: dict | None = None):
     body = {"session_id": session_id}
     if user:
         body["user"] = user                                   # a linked conversation needs its employee's email
-    return client.post("/reset", json=body)
+    return client.post("/reset", json=body, headers=token_headers(session_id))   # cookie, or the propose token
 
 
 # ------------------------------------------------------------- one session
@@ -89,9 +89,10 @@ def test_reset_of_an_unknown_session_is_harmless(client):
 
 def test_reset_drops_a_pending_ticket_draft(client):
     action = propose(client, "s-1", make_draft())
-    reset_one(client, "s-1")
-    out = approve(client, "s-1", action.action_id)
-    assert out["result"] is None and "nothing was filed" in out["reply"]
+    assert reset_one(client, "s-1").status_code == 200
+    out = approve(client, "s-1", action.action_id, expect=403)    # the reset also deleted the session token
+    assert out["result"] is None and out["state"] == "unauthorized"
+    assert created_tickets() == []
 
 
 def test_a_failed_deletion_is_reported_and_keeps_the_session(client, monkeypatch):

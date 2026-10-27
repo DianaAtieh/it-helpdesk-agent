@@ -15,7 +15,7 @@ import app.main as main
 from app.main import app, get_session, sessions
 from app.mcp_client import server_env
 from app.schemas import MAX_MESSAGE_CHARS
-from tests.helpers import arm_fault, created_tickets, make_draft, propose, requires_api
+from tests.helpers import arm_fault, created_tickets, make_draft, propose, requires_api, token_headers
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -37,7 +37,7 @@ def test_reject_during_a_slow_approval_cannot_hide_a_filed_ticket(client):
 
     async def approve_then_reject():
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as a:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test", headers=token_headers("s-1")) as a:
             body = {"session_id": "s-1", "action_id": action.action_id}
             approving = asyncio.create_task(a.post("/api/approve", json={**body, "approved": True}))
             await asyncio.sleep(0.5)                # Reject arrives while create_ticket is in flight

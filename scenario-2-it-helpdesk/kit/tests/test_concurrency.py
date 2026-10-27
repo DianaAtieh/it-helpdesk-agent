@@ -20,7 +20,8 @@ from langchain_core.messages import HumanMessage
 
 import app.main as main
 from app.main import app, get_session, sessions, thread_config
-from tests.helpers import approve, arm_fault, created_tickets, make_draft, propose, requires_api
+from tests.helpers import (approve, arm_fault, created_tickets, ensure_token, make_draft, propose, requires_api,
+                           token_headers)
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -32,10 +33,11 @@ def chat_body(session_id: str, message: str, user: dict | None = SARA) -> dict:
 
 
 def together(client, *requests: tuple[float, str, dict]) -> list[tuple[int, dict]]:
-    """Send (delay in seconds, path, body) requests concurrently. Returns (status, json) in the same order."""
+    """Send (delay in seconds, path, body) requests concurrently, each with its session's token if the test
+    issued one (ensure_token / propose). Returns (status, json) in the same order."""
     async def send(api: httpx.AsyncClient, delay: float, path: str, body: dict):
         await asyncio.sleep(delay)
-        r = await api.post(path, json=body)
+        r = await api.post(path, json=body, headers=token_headers(body["session_id"]))
         return r.status_code, r.json()
 
     async def run():
@@ -144,6 +146,7 @@ def test_a_chat_during_an_approval_waits_and_both_are_saved(client):
 
 
 def test_a_reset_during_a_chat_waits_for_it_and_the_conversation_does_not_come_back(client):
+    ensure_token(client, "s-1")                     # the owner holds the token before the race starts
     arm_fault("status", "slow")
     (_, out), (status, reset) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                          (0.3, "/reset", {"session_id": "s-1", "user": SARA}))
@@ -155,6 +158,7 @@ def test_a_reset_during_a_chat_waits_for_it_and_the_conversation_does_not_come_b
 
 def test_a_reset_that_waits_too_long_is_refused_and_deletes_nothing(client, monkeypatch):
     monkeypatch.setenv("SESSION_LOCK_WAIT_SECONDS", "0.5")
+    ensure_token(client, "s-1")
     arm_fault("status", "slow")
     (_, out), (status, _) = together(client, (0, "/api/chat", chat_body("s-1", "first")),
                                      (0.3, "/reset", {"session_id": "s-1", "user": SARA}))

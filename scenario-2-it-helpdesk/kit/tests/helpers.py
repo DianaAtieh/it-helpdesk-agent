@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import propose_draft
+from app.main import SESSION_TOKEN_HEADER, get_session, issue_session_token, propose_draft, session_turn
 from app.tickets import TicketDraft
 
 API = (os.getenv("HELPDESK_API_URL") or "http://localhost:8102").rstrip("/")
@@ -37,16 +37,43 @@ def make_draft(**overrides) -> TicketDraft:
     return TicketDraft(**fields)
 
 
+# Session tokens issued by ensure_token(), by session id. The clean fixture empties it. A session started by a
+# chat turn through the TestClient has its token in the client's cookie jar instead (sent automatically).
+TOKENS: dict[str, str] = {}
+
+
+async def _issue_token(session_id: str) -> str | None:
+    async with session_turn(get_session(session_id)):
+        return await issue_session_token(session_id)
+
+
+def ensure_token(client: TestClient, session_id: str) -> str | None:
+    """Start a NEW conversation's token without a chat turn (as /api/chat would) and remember it."""
+    token = client.portal.call(_issue_token, session_id)
+    if token:
+        TOKENS[session_id] = token
+    return token
+
+
+def token_headers(session_id: str) -> dict:
+    """The X-Session-Token header for a session whose token ensure_token() issued, else {} (cookie or none)."""
+    return {SESSION_TOKEN_HEADER: TOKENS[session_id]} if session_id in TOKENS else {}
+
+
 def propose(client: TestClient, session_id: str, draft: TicketDraft):
     # The same path the agent will use (load, check, save). It uses the app's MCP session and
-    # checkpointer, so it must run on the app's event loop.
+    # checkpointer, so it must run on the app's event loop. A conversation started here (no chat turn
+    # before) gets its session token first, like the first chat turn would give it.
+    ensure_token(client, session_id)
     action, _ = client.portal.call(propose_draft, session_id, draft)
     return action
 
 
-def approve(client: TestClient, session_id: str, action_id: str, approved: bool = True) -> dict:
-    r = client.post("/api/approve", json={"session_id": session_id, "action_id": action_id, "approved": approved})
-    assert r.status_code == 200
+def approve(client: TestClient, session_id: str, action_id: str, approved: bool = True,
+            expect: int = 200) -> dict:
+    r = client.post("/api/approve", json={"session_id": session_id, "action_id": action_id, "approved": approved},
+                    headers=token_headers(session_id))
+    assert r.status_code == expect
     return r.json()
 
 

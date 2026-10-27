@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, delete_all_threads, sessions
-from tests.helpers import API
+from tests.helpers import API, TOKENS
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -44,6 +44,8 @@ def clean(client):
     """
     httpx.post(f"{API}/admin/reset", timeout=5).raise_for_status()
     sessions.clear()
+    client.cookies.clear()                  # session tokens from earlier tests (the client is shared)
+    TOKENS.clear()
     client.portal.call(delete_all_threads, app.state.checkpointer)
     yield
     httpx.delete(f"{API}/admin/faults", timeout=5)

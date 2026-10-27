@@ -4,7 +4,8 @@
 
   V2   the Docker build context leaves out secrets and saved conversations (.dockerignore)
   V4   a message that gives the assistant instructions is answered once, never replayed from the history
-  V11  a conversation linked to an employee is reset only with that employee's email (or the admin token)
+  V11  only the conversation's owner (its session token) or an admin can reset it; older conversations
+       without a token keep the email rule
 (V6 is in tests/test_session_claim.py; V9 and the concurrency gaps of V14 in tests/test_concurrency.py.)
 
 Setup and fixtures: tests/conftest.py (needs the helpdesk API on port 8102).
@@ -18,6 +19,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app.guardrails import WITHHELD, looks_like_instructions
+from app.agent.graph import FINAL_NODE
 from app.main import DEFAULT_CHECKPOINT_DB, KIT, app, sessions, thread_config
 from tests.helpers import requires_api
 
@@ -130,6 +132,9 @@ def test_an_instruction_message_is_answered_once_then_kept_out_of_the_history(cl
 
 
 # ------------------------------------------------------------- V11: who may reset one conversation
+# Since the session token: a conversation with a token is reset with that token (here: the TestClient's
+# cookie, set by the first chat turn) or the admin token; an email alone is no longer enough. Conversations
+# saved before tokens existed keep the V11 rule (the linked email, or the admin token).
 
 def reset_one(client, session_id: str, user: dict | None = None, token: str | None = None):
     body = {"session_id": session_id}
@@ -139,11 +144,21 @@ def reset_one(client, session_id: str, user: dict | None = None, token: str | No
     return client.post("/reset", json=body, headers=headers)
 
 
+def legacy_conversation(client, session_id: str, email: str | None = None) -> None:
+    """A conversation saved before session tokens existed: a checkpoint without token_hash."""
+    values = {"messages": [HumanMessage(content="from before tokens")], **({"user_email": email} if email else {})}
+
+    async def save():
+        await app.state.graph.aupdate_state(thread_config(session_id), values, as_node=FINAL_NODE)
+    client.portal.call(save)
+
+
 @requires_api
 @pytest.mark.usefixtures("clean")
-@pytest.mark.parametrize("user", [None, SAMIR], ids=["no email", "another email"])
-def test_a_linked_conversation_cannot_be_reset_by_someone_else(client, user):
+@pytest.mark.parametrize("user", [None, SARA, SAMIR], ids=["no email", "the right email", "another email"])
+def test_a_conversation_cannot_be_reset_without_its_session_token(client, user):
     chat(client, "s-1", "my VPN fails")
+    client.cookies.clear()                                                    # a different client: no token
     r = reset_one(client, "s-1", user)
     assert r.status_code == 403
     assert len(saved(client, "s-1")["messages"]) == 2 and sessions["s-1"]["user"] == SARA
@@ -151,17 +166,18 @@ def test_a_linked_conversation_cannot_be_reset_by_someone_else(client, user):
 
 @requires_api
 @pytest.mark.usefixtures("clean")
-def test_the_linked_employee_can_reset_their_conversation(client):
+def test_the_client_holding_the_token_can_reset_its_conversation(client):
     chat(client, "s-1", "my VPN fails")
-    r = reset_one(client, "s-1", {"email": "  Sara.Mikhail@nakhla.example "})   # normalised like /api/chat
+    r = reset_one(client, "s-1")                                              # the cookie from the first turn
     assert r.status_code == 200 and saved(client, "s-1") == {}
 
 
 @requires_api
 @pytest.mark.usefixtures("clean")
-def test_an_admin_can_reset_a_linked_conversation(client, monkeypatch):
+def test_an_admin_can_reset_a_conversation(client, monkeypatch):
     monkeypatch.setenv("APP_ADMIN_TOKEN", TOKEN)
     chat(client, "s-1", "my VPN fails")
+    client.cookies.clear()
     assert reset_one(client, "s-1", token="wrong").status_code == 403
     assert reset_one(client, "s-1", token=TOKEN).status_code == 200
     assert saved(client, "s-1") == {}
@@ -169,18 +185,34 @@ def test_an_admin_can_reset_a_linked_conversation(client, monkeypatch):
 
 @requires_api
 @pytest.mark.usefixtures("clean")
-def test_an_anonymous_conversation_can_still_be_reset_with_its_id(client):
+def test_an_anonymous_conversation_also_needs_its_token(client):
     chat(client, "s-1", "hello", user=None)
+    jar = dict(client.cookies)
+    client.cookies.clear()
+    assert reset_one(client, "s-1").status_code == 403
+    client.cookies.update(jar)
     assert reset_one(client, "s-1").status_code == 200
     assert saved(client, "s-1") == {}
 
 
 @requires_api
 @pytest.mark.usefixtures("clean")
+def test_a_conversation_from_before_tokens_keeps_the_email_rule(client):
+    legacy_conversation(client, "s-1", SARA["email"])
+    assert reset_one(client, "s-1").status_code == 403
+    assert reset_one(client, "s-1", SAMIR).status_code == 403
+    assert reset_one(client, "s-1", SARA).status_code == 200
+    legacy_conversation(client, "s-2")                                        # anonymous: its id is enough
+    assert reset_one(client, "s-2").status_code == 200
+
+
+@requires_api
+@pytest.mark.usefixtures("clean")
 def test_the_reset_rule_holds_after_a_restart(client):
     chat(client, "s-1", "my VPN fails")
-    sessions.clear()                                                          # the link is only on disk now
-    assert reset_one(client, "s-1").status_code == 403
+    sessions.clear()                                                          # the token hash is only on disk
+    client.cookies.clear()
+    assert reset_one(client, "s-1", SARA).status_code == 403
     assert len(saved(client, "s-1")["messages"]) == 2
 
 
