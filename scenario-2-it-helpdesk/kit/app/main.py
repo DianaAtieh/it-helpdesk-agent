@@ -92,7 +92,8 @@ async def lifespan(app: FastAPI):
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
-        app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm)
+        app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm,
+                                      evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"))
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
                  db_path, expired, retention_days())
@@ -625,7 +626,8 @@ async def _approve(req: ApproveRequest, session: dict, token: str | None) -> Cha
         )
 
     # Exactly the approved payload, with the action id as the idempotency key.
-    data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id})
+    data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id},
+                                approved=True)
     ticket_id = str((data.get("ticket") or {}).get("ticket_id", "")) if data.get("ok") else ""
 
     if data.get("ok") and TICKET_ID.fullmatch(ticket_id):

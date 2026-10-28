@@ -4,8 +4,8 @@ One MCP session is started together with our app and reused for every call, so
 we do not pay the server's start-up time on each request. Every call is timed
 and returned as a ToolCall for the ChatResponse's tool_calls.
 
-The write tools (create_ticket, add_ticket_note) also go through here, but only
-/api/approve may call them, never the LLM.
+The write tool create_ticket also goes through here, but only /api/approve may call it (approved=True),
+never the LLM; every other tool outside READ_TOOLS is refused before reaching the server.
 """
 from __future__ import annotations
 
@@ -28,6 +28,11 @@ KIT = Path(__file__).resolve().parent.parent
 CALL_TIMEOUT = timedelta(seconds=25)   # the MCP server itself gives up on the API after 20 s
 
 log = logging.getLogger("helpdesk-app.mcp")
+
+# Authorization is decided here, in code. Graph nodes get the read tools only; the one write tool the app
+# uses (create_ticket) also needs approved=True, which only /api/approve passes. Any other tool is refused.
+READ_TOOLS = frozenset({"lookup_employee", "get_service_status", "search_tickets"})
+APPROVED_WRITE_TOOLS = frozenset({"create_ticket"})
 
 
 def _tool_json(result: Any) -> dict:
@@ -75,10 +80,18 @@ class HelpdeskMCP:
         self._stack = None
         self._session = None
 
-    async def call(self, tool: str, args: dict | None = None) -> tuple[dict, ToolCall]:
-        """Call one MCP tool. Never raises: failures come back as {"ok": False, "error": {...}}."""
+    async def call(self, tool: str, args: dict | None = None, *, approved: bool = False) -> tuple[dict, ToolCall]:
+        """Call one MCP tool. Never raises: failures come back as {"ok": False, "error": {...}}.
+
+        Only READ_TOOLS are allowed by default; APPROVED_WRITE_TOOLS need approved=True. Refused calls
+        never reach the MCP server.
+        """
         start = time.perf_counter()
-        if self._session is None:
+        if tool not in READ_TOOLS and not (approved and tool in APPROVED_WRITE_TOOLS):
+            log.warning("MCP call refused: tool=%s approved=%s", tool, approved)
+            data = {"ok": False, "error": {"code": "tool_not_permitted",
+                                           "message": "This tool is not permitted from this code path."}}
+        elif self._session is None:
             data = {"ok": False, "error": {"code": "mcp_not_started", "message": "The MCP server is not running."}}
         else:
             try:

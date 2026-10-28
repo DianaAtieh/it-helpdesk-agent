@@ -19,9 +19,9 @@ import asyncio
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from ingestion.build_index import DEFAULT_DB
 from ingestion.embeddings import DEFAULT_BASE_URL, EmbeddingError, OpenRouterEmbeddings, RetryPolicy
@@ -65,6 +65,10 @@ class KBResult:
     requires_department_verification: bool
     rule_warnings: tuple[str, ...]
     ms: int
+    # Structured coverage of the rule lanes, {"department_rules": status, "governing_policy": status}, from
+    # ingestion.rule_lanes. The answer gate decides on this, never on the rule_warnings text. Empty when the
+    # source gives none (test fakes): the gate then has nothing to act on.
+    rule_coverage: dict[str, str] = field(default_factory=dict)
 
     @property
     def doc_ids(self) -> frozenset[str]:
@@ -77,7 +81,8 @@ class KBResult:
                 "undocumented_codes": list(self.undocumented_codes), "sufficiency": self.sufficiency,
                 "department": self.department,
                 "requires_department_verification": self.requires_department_verification,
-                "rule_warnings": list(self.rule_warnings)}
+                "rule_warnings": list(self.rule_warnings), "rule_coverage": dict(self.rule_coverage) if isinstance(self.rule_coverage, Mapping)
+                else self.rule_coverage}      # a malformed value is passed on for the retrieve node to reject
 
 
 class KnowledgeBase(Protocol):
@@ -120,7 +125,8 @@ def build_result(response, query: str, ms: int) -> KBResult:
                          if code in view.undocumented_codes
                          or not any(codes_in_text(text, (code,)) for text in texts))
     return KBResult(records, codes, undocumented, view.sufficiency.level, view.department,
-                    bool(view.requires_department_verification), tuple(view.rule_warnings), ms)
+                    bool(view.requires_department_verification), tuple(view.rule_warnings), ms,
+                    {str(lane): str(status) for lane, status in view.rule_coverage.items()})
 
 
 class PolicyKnowledgeBase:

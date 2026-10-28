@@ -19,6 +19,8 @@ from app.agent.state import AgentState
 from app.agent.verifier import verify_answer
 from app.guardrails import redact_secrets
 from app.llm import ChatModel, LLMError
+from ingestion.rule_lanes import (COMPLETE, DEPARTMENT_REQUIRED, LANE_DEPARTMENT, LANE_GOVERNING, NO_INVENTORY_RULE,
+                                  PARTIAL, TOPIC_NOT_ESTABLISHED, UNAVAILABLE)
 
 log = logging.getLogger("helpdesk-app.agent")
 
@@ -182,7 +184,7 @@ def make_retrieve(kb: KnowledgeBase | None) -> Callable[[AgentState], Awaitable[
         department = employee.get("department") if isinstance(employee, dict) else None
         calls = list(state.get("tool_calls") or [])          # triage's calls of this turn come first
         empty = {"evidence": [], "undocumented_codes": [], "sufficiency": "none",
-                 "requires_department_verification": False, "rule_warnings": []}
+                 "requires_department_verification": False, "rule_warnings": [], "rule_coverage": {}}
         if kb is None:
             return {**empty, "kb_status": "unavailable", "tool_calls": calls}
         try:
@@ -191,17 +193,28 @@ def make_retrieve(kb: KnowledgeBase | None) -> Callable[[AgentState], Awaitable[
             calls.append({"tool": KB_TOOL, "ok": False, "ms": 0})
             return {**empty, "kb_status": exc.code, "tool_calls": calls}
         calls.append({"tool": KB_TOOL, "ok": True, "ms": result.ms})
-        found = result.to_state()
-        codes = list(dict.fromkeys([*(state.get("codes") or []), *found["codes"]]))
-        # Security policies win (manifest rule 1): a non-SP chunk recommending a forbidden action never reaches
-        # the model, the escalation's kb_refs or the verifier. SP chunks and prohibitions are kept.
-        evidence, _dropped = policy.filter_evidence(found["evidence"])
-        return {"evidence": evidence, "undocumented_codes": found["undocumented_codes"],
-                "sufficiency": found["sufficiency"],
-                "requires_department_verification": found["requires_department_verification"],
-                "rule_warnings": found["rule_warnings"], "codes": codes, "kb_status": "ok", "tool_calls": calls}
+        return {**retrieval_update(result, state), "kb_status": "ok", "tool_calls": calls}
 
     return retrieve
+
+
+def retrieval_update(result, state: AgentState) -> dict:
+    """The state fields a knowledge-base result produces (shared by retrieve and the evidence evaluator's retry,
+    so a retried search goes through exactly the same filtering and coverage validation)."""
+    found = result.to_state()
+    codes = list(dict.fromkeys([*(state.get("codes") or []), *found["codes"]]))
+    # Security policies win (manifest rule 1): a non-SP chunk recommending a forbidden action never reaches
+    # the model, the escalation's kb_refs or the verifier. SP chunks and prohibitions are kept.
+    evidence, _dropped = policy.filter_evidence(found["evidence"])
+    coverage = validated_coverage(found["rule_coverage"])
+    warnings = list(found["rule_warnings"])
+    if coverage != found["rule_coverage"]:
+        log.warning("policy gate: rule_coverage missing or malformed, failing closed")
+        warnings.append(COVERAGE_INVALID_WARNING)
+    return {"evidence": evidence, "undocumented_codes": found["undocumented_codes"],
+            "sufficiency": found["sufficiency"],
+            "requires_department_verification": found["requires_department_verification"],
+            "rule_warnings": warnings, "rule_coverage": coverage, "codes": codes}
 
 
 # ---------------------------------------------------------------- answer (Phase 2): the one LLM call
@@ -213,6 +226,47 @@ KB_UNAVAILABLE_REPLY = ("I couldn't search the IT knowledge base right now, so I
 LLM_FAILED_REPLY = "Sorry, I couldn't prepare an answer right now. Please try again in a moment."
 UNGROUNDED_REPLY = ("I couldn't find documented steps for this in the IT knowledge base. If you tell me the exact "
                     "error message or code, I can look again, or I can escalate it to IT as a ticket.")
+
+
+POLICY_UNVERIFIED_REPLY = ("I can't give you troubleshooting steps for this right now: the IT policy that applies "
+                           "to it could not be verified. Please try again later, or I can escalate it to IT as a "
+                           "ticket so a technician can help.")
+DEPARTMENT_VERIFICATION_REPLY = ("Some IT rules for this problem depend on your department, and I couldn't confirm "
+                                 "yours from the company directory. What is your work email, so I can check which "
+                                 "rules apply to you?")
+
+# Rule-lane coverage statuses that need no block: the lane was checked, or it was checked and nothing applies.
+# Every other value ("unavailable", "partial", or one this code does not know) fails closed. An absent
+# rule_coverage means the retriever reported none, and nothing is blocked on it.
+_COVERAGE_VERIFIED = frozenset({COMPLETE, NO_INVENTORY_RULE, TOPIC_NOT_ESTABLISHED, DEPARTMENT_REQUIRED})
+_COVERAGE_LANES = (LANE_DEPARTMENT, LANE_GOVERNING)
+_COVERAGE_KNOWN = _COVERAGE_VERIFIED | {UNAVAILABLE, PARTIAL}
+COVERAGE_INVALID_WARNING = ("RULE COVERAGE INVALID: the retriever gave no valid coverage for the rule lanes, so "
+                            "governing_policy could not be checked.")
+
+
+def validated_coverage(raw: object) -> dict[str, str]:
+    """The retriever's rule_coverage if it is a dict with both lanes and a known status string for each.
+
+    Anything else (missing, empty, not a dict, a lane absent, an unknown or non-string status) becomes
+    "unavailable" for both lanes, so the answer gate blocks instead of treating it as "nothing applies".
+    """
+    if isinstance(raw, dict) and all(isinstance(raw.get(lane), str) and raw[lane] in _COVERAGE_KNOWN
+                                     for lane in _COVERAGE_LANES):
+        return {lane: raw[lane] for lane in _COVERAGE_LANES}
+    return {lane: UNAVAILABLE for lane in _COVERAGE_LANES}
+
+
+def policy_coverage_unverified(state: AgentState) -> bool:
+    """True when a mandatory rule lane could not be fully checked (decided on the structured status only)."""
+    coverage = state.get("rule_coverage")
+    return isinstance(coverage, dict) and any(status not in _COVERAGE_VERIFIED for status in coverage.values())
+
+
+def department_unverified(state: AgentState) -> bool:
+    """True when department rules apply to the topic but the directory gave no department."""
+    coverage = state.get("rule_coverage")
+    return isinstance(coverage, dict) and coverage.get(LANE_DEPARTMENT) == DEPARTMENT_REQUIRED
 
 
 def not_documented_reply(codes: list[str]) -> str:
@@ -306,27 +360,61 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         if not evidence:
             return result(not_documented_reply(undocumented) if undocumented else clarify_reply(state),
                           "not_documented" if undocumented else "clarify")
+        # Safety gate, before the one model call: no troubleshooting while a mandatory policy lane is unverified
+        # (the structured coverage, not the warning text), and none while department rules apply but the
+        # directory gave no department. Both are fixed replies with no model call and no citations.
+        if policy_coverage_unverified(state):
+            log.info("policy gate: rule coverage unverified, answer model not called")
+            return result(POLICY_UNVERIFIED_REPLY, "blocked")
+        if department_unverified(state):
+            return result(DEPARTMENT_VERIFICATION_REPLY, "clarify")
+        # The evidence evaluator's (optional) verdict comes only after every deterministic gate above: it can
+        # hold the answer back with a fixed reply, never lift a gate. See app/agent/evidence_eval.py.
+        held = evaluation_hold(state)
+        if held:
+            return result(held["reply"], held["outcome"], usage=state.get("evaluation_usage"))
         if llm is None:
             return result(LLM_FAILED_REPLY, "error")
 
         try:
             out = await llm.complete_json(SYSTEM_PROMPT, build_answer_input(state, latest_user_text(state)))
         except LLMError:
-            return result(LLM_FAILED_REPLY, "error")
+            return result(LLM_FAILED_REPLY, "error", usage=state.get("evaluation_usage"))
+        used = add_usage(state.get("evaluation_usage"), out.usage)
         reply = out.data.get("reply")
         if not isinstance(reply, str) or not reply.strip():
-            return result(LLM_FAILED_REPLY, "error", usage=out.usage)
+            return result(LLM_FAILED_REPLY, "error", usage=used)
         reply = reply.strip()[:MAX_REPLY_CHARS]
         citations = cited(out.data, evidence)
         if out.data.get("needs_clarification") is True:
             # A question needs no citation, so it must really be only a question; otherwise ask our own.
             question = reply if is_safe_clarification(reply) else clarify_reply(state)
-            return result(question, "clarify", [], out.usage)
+            return result(question, "clarify", [], used)
         if not citations:                                   # an answer must rest on the evidence it was given
-            return result(UNGROUNDED_REPLY, "not_documented", usage=out.usage)
-        return result(reply, "answered", citations, out.usage)
+            return result(UNGROUNDED_REPLY, "not_documented", usage=used)
+        return result(reply, "answered", citations, used)
 
     return answer
+
+
+def evaluation_hold(state: AgentState) -> dict | None:
+    """The evaluator's fixed reply and outcome when it held the answer back (CLARIFY or SAFE_FALLBACK), else None.
+    Only a dict with a known outcome and a string reply counts; anything else changes nothing."""
+    held = state.get("evaluation_hold")
+    if isinstance(held, dict) and held.get("outcome") in ("clarify", "not_documented") \
+            and isinstance(held.get("reply"), str) and held["reply"]:
+        return held
+    return None
+
+
+def add_usage(first: dict | None, second: dict | None) -> dict:
+    """Token counts of two model calls of one turn, added (the evaluator's and the answer's)."""
+    total: dict = {}
+    for usage in (first, second):
+        for key, value in (usage or {}).items():
+            if isinstance(value, int):
+                total[key] = total.get(key, 0) + value
+    return total
 
 
 # ---------------------------------------------------------------- escalate (Phase 4): a draft proposal only

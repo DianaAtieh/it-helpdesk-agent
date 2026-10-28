@@ -38,13 +38,24 @@ class AgentState(TypedDict, total=False):
     #   undocumented_codes  codes in the question that no evidence mentions (e.g. CRM-1150)
     #   sufficiency     the retriever's level: sufficient | conditional_only | context_only | none
     #   requires_department_verification, rule_warnings: from the retriever, passed on to the answer
+    #   rule_coverage   {lane: status} from the retriever's rule lanes (complete | partial | unavailable |
+    #                   department_required | no_inventory_rule | topic_not_established). The answer node's
+    #                   safety gate reads this, never the rule_warnings text.
     #   kb_status       ok | unavailable | search_failed
     evidence: list[dict]
     undocumented_codes: list[str]
     sufficiency: str
     requires_department_verification: bool
     rule_warnings: list[str]
+    rule_coverage: dict[str, str]
     kb_status: str
+    # Evidence evaluation (optional step after retrieve, app/agent/evidence_eval.py; written every turn it runs):
+    #   evaluation        {"decision", "evaluations", "retried", ...}: a trace of the proposal and what code did with it
+    #   evaluation_hold   {"outcome", "reply"} when the evaluator held the answer back (fixed code-written reply)
+    #   evaluation_usage  the evaluator's token counts, added to the answer's usage
+    evaluation: dict
+    evaluation_hold: dict | None
+    evaluation_usage: dict
     # Answer (Phase 2):
     #   citations       [{"id", "title"}], only documents that are in this turn's evidence
     #   outcome         answered | clarify | not_documented | policy_refusal | error
