@@ -314,3 +314,82 @@ def build_draft(fields: dict, state: dict, text: str) -> EscalationOutcome:
         "affected_users": affected,
     }
     return EscalationOutcome("draft", draft=draft, notes=notes)
+
+
+# ---------------------------------------------------------------- the requester's open tickets (memory)
+#
+# search_tickets gives the employee's ticket history from the helpdesk API, the system of record, so it is the
+# same in every session and after a restart. It is used ONLY here, in code, to avoid a second ticket for a problem
+# that already has an open one. Privacy: the email given in chat is not proof of identity, so nothing from the
+# history is ever shown to the employee or given to the model: no ticket ID, subject, description, note or
+# resolution. Only two derived signals are kept per OPEN ticket: its error codes and normalised subject keywords.
+# Ticket text is untrusted (a past ticket may carry planted instructions); keywords cannot carry an instruction.
+
+DUPLICATE_REPLY = ("It looks like a request about this problem is already open with the IT Service Desk, so I "
+                   "haven't prepared another ticket. If something has changed, tell me what's new, or contact the "
+                   "Service Desk directly.")
+MAX_OPEN_TICKETS = 10
+_HISTORY_CODE = re.compile(r"\b[A-Z]{2,5}-\d{2,5}\b")
+_HISTORY_WORD = re.compile(r"[a-z0-9][a-z0-9-]*")
+_HISTORY_STOPWORDS = frozenset("""
+    a an and the of on in at to for from with without by my our your his her their me we i you it its is are was
+    were be been am not no nor or but so cannot can can't does doesn't do don't did didn't this that these those
+    after before since when while still any all every new old very please help issue issues problem problems error
+    errors broken working work works fails failed failing failure ticket tickets open opened request show shows
+    nakhla today yesterday morning again also just get got some anything nothing
+""".split())
+
+
+def _history_keywords(text: str) -> set[str]:
+    """Lower-case words without stopwords, codes or ticket IDs; a trailing plural "s" removed (monitors -> monitor)."""
+    words = set()
+    for word in _HISTORY_WORD.findall(_HISTORY_CODE.sub(" ", text or "").lower()):
+        if len(word) < 2 or word in _HISTORY_STOPWORDS or re.fullmatch(r"it-\d+", word):
+            continue
+        words.add(word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word)
+    return words
+
+
+def history_signals(tickets) -> list[dict]:
+    """The minimum kept from search_tickets: per OPEN ticket, {"codes": [...], "keywords": [...]} from its subject.
+    Nothing else (no ID, subject text, description, notes, resolution or requester) leaves this function."""
+    out = []
+    for ticket in tickets if isinstance(tickets, list) else []:
+        if not isinstance(ticket, dict) or ticket.get("status") != "open":
+            continue
+        subject = str(ticket.get("subject") or "")[:200]
+        codes = sorted({c for c in _HISTORY_CODE.findall(subject) if not c.startswith("IT-")})
+        out.append({"codes": codes, "keywords": sorted(_history_keywords(subject))})
+        if len(out) == MAX_OPEN_TICKETS:
+            break
+    return out
+
+
+def duplicate_text(messages: list) -> str:
+    """What the duplicate check compares with the open tickets: the employee's latest message, plus the previous
+    employee message ONLY when the latest one continues the ticket request (a clear yes to the agent's offer to
+    escalate, or the answer to its question for the attempted steps), because then the problem was described one
+    message earlier. A new request is judged on its own words, so an earlier, unrelated topic in the same
+    conversation never turns it into a duplicate."""
+    latest, previous_assistant = last_messages(messages)
+    continues = bool(previous_assistant) and (
+        continues_ticket_request(previous_assistant)
+        or bool(_ESCALATION_OFFER.search(previous_assistant) and _CLEAR_YES.match(latest or "")))
+    if not continues:
+        return latest
+    employee = [str(m.content) for m in messages or [] if isinstance(m, HumanMessage)]
+    earlier = employee[-2] if len(employee) >= 2 else ""
+    return f"{earlier}\n{latest}".strip()
+
+
+def open_duplicate(signals: list[dict], text: str, codes: list[str] | tuple[str, ...] = ()) -> bool:
+    """True if the request matches one of the requester's open tickets: a shared error code, or at least two shared
+    meaningful subject keywords (e.g. "dock" and "d3")."""
+    asked_codes = {c for c in (*codes, *_HISTORY_CODE.findall(text or "")) if not c.startswith("IT-")}
+    asked_words = _history_keywords(text)
+    for signal in signals or []:
+        if set(signal.get("codes") or ()) & asked_codes:
+            return True
+        if len(set(signal.get("keywords") or ()) & asked_words) >= 2:
+            return True
+    return False

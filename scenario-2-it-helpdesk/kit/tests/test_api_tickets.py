@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage
 
-from app.agent.escalation import DRAFT_READY_REPLY, IDENTITY_NOTICE
+from app.agent.escalation import DRAFT_READY_REPLY, DUPLICATE_REPLY, IDENTITY_NOTICE
 from app.agent.graph import build_graph
 from app.main import DRAFT_IDENTITY_REPLY, DRAFT_INVALID_REPLY, app, mcp, sessions, thread_config
 from app.tickets import IDENTITY_SUMMARY_FLAG
@@ -113,6 +113,20 @@ def test_replaying_the_approval_files_once(client, agent):
     first = approve(client, "s-1", pending["action_id"])
     again = approve(client, "s-1", pending["action_id"])
     assert again["result"] == {"ticket_id": first["result"]["ticket_id"]} and "already filed" in again["reply"]
+    assert len(created_tickets()) == 1
+
+
+def test_a_ticket_filed_in_one_session_is_remembered_in_a_new_session_without_details(client, agent):
+    # Memory: the helpdesk's ticket archive is the system of record, so a ticket filed in session A is found by
+    # search_tickets in a NEW session B for the same email. B gets the generic duplicate reply: no second draft,
+    # and no ticket ID or subject (the email is not proof of identity).
+    agent(FIELDS)
+    pending = chat(client, "s-a", REQUEST)["pending_action"]
+    ticket_id = approve(client, "s-a", pending["action_id"])["result"]["ticket_id"]
+    out = chat(client, "s-b", REQUEST)
+    assert out["state"] == "blocked" and out["reply"] == DUPLICATE_REPLY and out["pending_action"] is None
+    assert ticket_id not in out["reply"] and FIELDS["subject"] not in out["reply"]
+    assert ("search_tickets", True) in [(c["tool"], c["ok"]) for c in out["tool_calls"]]
     assert len(created_tickets()) == 1
 
 
