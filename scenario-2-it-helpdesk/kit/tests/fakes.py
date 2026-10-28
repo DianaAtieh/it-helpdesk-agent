@@ -34,9 +34,13 @@ def evidence(doc_id: str, text: str, *, title: str = "", source: str = "evidence
 
 
 def kb_result(*records: dict, codes: tuple[str, ...] = (), undocumented: tuple[str, ...] = (),
-              sufficiency: str = "sufficient", department: str | None = None) -> KBResult:
+              sufficiency: str = "sufficient", department: str | None = None,
+              rule_coverage: dict[str, str] | None = None) -> KBResult:
+    """Defaults to explicit complete coverage on both rule lanes, as a real retrieval result always has both."""
+    coverage = {"department_rules": "complete", "governing_policy": "complete"} if rule_coverage is None \
+        else rule_coverage
     return KBResult(tuple(records), codes, undocumented, sufficiency if records else "none", department,
-                    False, (), 1)
+                    False, (), 1, coverage)
 
 
 class FakeKnowledgeBase:
