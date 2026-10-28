@@ -134,6 +134,22 @@ def test_c5_finance_vpn_exception_is_in_the_department_rules(retriever):
     assert all(r.status == "current" and r.authoritative for r in view.department_rules)
 
 
+@pytest.mark.parametrize("query", [
+    "NakhlaID says NID-423 when I try to sign in. What should I do?",                         # sample case S2-01
+    "My account showed NID-423 twice today. When do lockouts have to be reported to Security Operations?",
+])
+def test_the_lockout_reporting_threshold_reaches_the_model_word_for_word(retriever, query):
+    # SP-001's threshold is "three or more lockouts in one day", not "multiple lockouts". The verifier cannot
+    # check a paraphrase that has no number, so the exact sentence must at least be in what the model is given
+    # (the evidence the app builds, app.agent.retrieval.build_result). The model's wording is checked by the
+    # real-model eval cases S2-P07 and S2-P08 (evals/cases.policy.jsonl).
+    from app.agent.retrieval import build_result
+    records = build_result(retriever.search(query, 5), query, 0).evidence
+    sp001 = " ".join(r["text"] for r in records if r["doc_id"] == "SP-001")
+    assert "Three or more lockouts in one day without a known cause" in sp001
+    assert "report them to Security Operations" in sp001
+
+
 def test_the_finance_vpn_exception_does_not_leak_into_other_topics(retriever):
     _, view = search(retriever, "Printer shows PRN-21", "Finance")
     assert not any(r.doc_id == "KB-002" for r in view.department_rules)

@@ -5,18 +5,22 @@ can pass fakes. The flow (app/agent/graph.py): triage -> (incident | retrieve ->
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Awaitable, Callable, Protocol
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent import escalation
+from app.agent import escalation, policy
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
 from app.agent.retrieval import KnowledgeBase, KnowledgeBaseError, strict_codes
 from app.agent.state import AgentState
+from app.agent.verifier import verify_answer
 from app.guardrails import redact_secrets
 from app.llm import ChatModel, LLMError
+
+log = logging.getLogger("helpdesk-app.agent")
 
 
 class MCPClient(Protocol):
@@ -189,7 +193,10 @@ def make_retrieve(kb: KnowledgeBase | None) -> Callable[[AgentState], Awaitable[
         calls.append({"tool": KB_TOOL, "ok": True, "ms": result.ms})
         found = result.to_state()
         codes = list(dict.fromkeys([*(state.get("codes") or []), *found["codes"]]))
-        return {"evidence": found["evidence"], "undocumented_codes": found["undocumented_codes"],
+        # Security policies win (manifest rule 1): a non-SP chunk recommending a forbidden action never reaches
+        # the model, the escalation's kb_refs or the verifier. SP chunks and prohibitions are kept.
+        evidence, _dropped = policy.filter_evidence(found["evidence"])
+        return {"evidence": evidence, "undocumented_codes": found["undocumented_codes"],
                 "sufficiency": found["sufficiency"],
                 "requires_department_verification": found["requires_department_verification"],
                 "rule_warnings": found["rule_warnings"], "codes": codes, "kb_status": "ok", "tool_calls": calls}
@@ -283,6 +290,11 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         codes = list(state.get("codes") or [])
         undocumented = list(state.get("undocumented_codes") or [])
 
+        # A clear request to break a security policy gets the fixed refusal, before anything else, with no model
+        # call. Its one citation is the rule's SP document, issued by code (kept apart in policy_citations).
+        refused = policy.check_request(latest_user_text(state), state.get("employee"), codes)
+        if refused:
+            return {**result(refused.reply, "policy_refusal"), "policy_citations": [refused.citation]}
         if state.get("kb_status") != "ok":
             return result(KB_UNAVAILABLE_REPLY, "error")
         # Nobody known and no error code: ask who they are and what they see before any answer (S2-02).
@@ -342,6 +354,12 @@ def make_escalate(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dic
         if blocked:
             reason, reply = blocked
             return result(reply, "clarify" if reason == "no_identity" else "blocked")
+        # No draft for a ticket that asks for something a security policy forbids (an admin password, an SMS
+        # code, a security bypass). PHONE_RESET is the exception: SP-001 section 2 makes a ticket the allowed path
+        # for an assisted reset (with manager approval and in-person or video identity verification).
+        refused = policy.check_request(text, state.get("employee"), state.get("codes") or [])
+        if refused and refused.rule != "PHONE_RESET":
+            return {**result(refused.reply, "policy_refusal"), "policy_citations": [refused.citation]}
         if llm is None:
             return result(escalation.ESCALATION_FAILED_REPLY, "error")
         try:
@@ -443,6 +461,24 @@ def safe_reply(text: str) -> str:
     return text or LLM_FAILED_REPLY
 
 
+def employee_messages(state: AgentState) -> str:
+    """Everything the employee wrote in this conversation (as stored: redacted, capped at the last messages). The
+    verifier accepts facts the employee gave, also in an earlier turn (e.g. before a clarifying question)."""
+    return "\n".join(str(m.content) for m in state.get("messages") or [] if isinstance(m, HumanMessage))
+
+
+def valid_policy_citations(raw) -> list[dict]:
+    """Code-issued citations from this turn, kept only if they name an SP document of a policy rule."""
+    allowed = set(policy.RULE_DOC.values())
+    out = []
+    for citation in raw or []:
+        if (isinstance(citation, dict) and citation.get("id") in allowed
+                and citation.get("source") == policy.POLICY_SOURCE):
+            out.append({"id": citation["id"], "title": policy.TITLES.get(citation["id"], ""),
+                        "source": policy.POLICY_SOURCE})
+    return list({c["id"]: c for c in out}.values())
+
+
 def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
     """The node that ends every turn (FINAL_NODE): one place that checks what leaves the agent.
 
@@ -457,6 +493,7 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
     async def respond(state: AgentState) -> dict:
         incident = state.get("active_incident")
         draft = None
+        policy_citations: list[dict] = []
         if state.get("route") == "incident" and isinstance(incident, dict) and incident.get("id"):
             reply, outcome, citations, usage = incident_reply(incident), "incident", [], {}
         else:
@@ -470,10 +507,31 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
             usage = dict(state.get("usage") or {})
             if outcome == "answered" and not citations:
                 reply, outcome = UNGROUNDED_REPLY, "not_documented"
+            if outcome == "answered":                       # a model-written answer: Phase 3 checks
+                advice = policy.find_forbidden_advice(reply)
+                if advice:                                  # the whole reply goes, never a patched version
+                    log.info("policy: model answer replaced by the %s refusal", advice.rule)
+                    reply, outcome, citations = advice.reply, "policy_refusal", []
+                    policy_citations = [advice.citation]
+                else:
+                    checked = verify_answer(reply, citations, list(state.get("evidence") or []),
+                                            employee_messages(state), fallback_reply=UNGROUNDED_REPLY)
+                    # Counts only: never the reply, the removed sentences, the facts or the employee's words.
+                    log.info("verifier: checked=%d unsupported=%d removed_sentences=%d citations_dropped=%d "
+                             "fallback=%s", checked.checked, len(checked.unsupported), len(checked.removed),
+                             len(citations) - len(checked.citations), checked.fallback)
+                    reply, citations = checked.reply, checked.citations
+                    if checked.fallback:
+                        outcome = "not_documented"
+            if outcome == "policy_refusal" and not policy_citations:
+                policy_citations = valid_policy_citations(state.get("policy_citations"))
             if outcome == "draft_proposed" and isinstance(state.get("draft"), dict):
                 draft = dict(state["draft"])
         reply = safe_reply(reply)
-        return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": citations,
-                "outcome": outcome, "usage": usage, "draft": draft}
+        # The response shows model/evidence citations and, on a refusal, the code-issued SP citation; the state
+        # keeps the code-issued ones apart (policy_citations), so they are never mistaken for the model's.
+        shown = citations + [{"id": c["id"], "title": c["title"]} for c in policy_citations]
+        return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
+                "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft}
 
     return respond
