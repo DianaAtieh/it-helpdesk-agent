@@ -10,7 +10,9 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.prompts import SYSTEM_PROMPT, build_answer_input
+from app.agent import escalation
+from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
+                               build_escalation_input)
 from app.agent.retrieval import KnowledgeBase, KnowledgeBaseError, strict_codes
 from app.agent.state import AgentState
 from app.guardrails import redact_secrets
@@ -315,6 +317,48 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
     return answer
 
 
+# ---------------------------------------------------------------- escalate (Phase 4): a draft proposal only
+
+def route_after_retrieve(state: AgentState) -> str:
+    """The conditional edge after retrieve: "escalate" for a ticket request (decided in code from the
+    conversation, see escalation.wants_ticket), otherwise "answer"."""
+    return "escalate" if escalation.wants_ticket(state.get("messages") or []) else "answer"
+
+
+def make_escalate(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]]:
+    """Prepare a ticket draft PROPOSAL in the state. It never files, approves or sends anything.
+
+    Order: the deterministic blockers first (no identity, no directory record, a Contractor VPN request), with
+    no model call; then one tool-free model call for the descriptive fields only; then escalation.build_draft,
+    which sets the requester, department, category, priority and kb_refs in code. Every reply is a fixed text.
+    """
+
+    def result(reply: str, outcome: str, draft: dict | None = None, usage: dict | None = None) -> dict:
+        return {"reply": reply, "outcome": outcome, "draft": draft, "citations": [], "usage": usage or {}}
+
+    async def escalate(state: AgentState) -> dict:
+        text, _ = escalation.last_messages(state.get("messages") or [])
+        blocked = escalation.ticket_blocker(state, text)
+        if blocked:
+            reason, reply = blocked
+            return result(reply, "clarify" if reason == "no_identity" else "blocked")
+        if llm is None:
+            return result(escalation.ESCALATION_FAILED_REPLY, "error")
+        try:
+            out = await llm.complete_json(ESCALATION_SYSTEM_PROMPT, build_escalation_input(state, text))
+        except LLMError:
+            return result(escalation.ESCALATION_FAILED_REPLY, "error")
+        outcome = escalation.build_draft(out.data, state, text)
+        if outcome.kind == "draft":
+            return result(escalation.draft_reply(outcome.draft, state.get("employee")), "draft_proposed",
+                          outcome.draft, out.usage)
+        if outcome.kind == "ask_steps":
+            return result(outcome.reply, "clarify", usage=out.usage)
+        return result(outcome.reply, "blocked", usage=out.usage)
+
+    return escalate
+
+
 # ---------------------------------------------------------------- respond (Phase 2): the last check, no LLM
 
 # A ticket ID may only ever come from the ticket system, in /api/approve's `result`. Never in a chat reply.
@@ -405,11 +449,14 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
       * a verified active incident gets the status-page template (no citations, no model);
       * otherwise the answer node's reply: citations kept only if they are documents in THIS turn's evidence,
         and an "answered" reply left with no valid citation is replaced by the honest fallback;
-      * always: secrets redacted, invented ticket IDs and "ticket created" claims removed, non-empty, bounded.
+      * always: secrets redacted, invented ticket IDs and "ticket created" claims removed, non-empty, bounded;
+      * a ticket draft proposal survives only on the turn escalate made it (outcome "draft_proposed"); on every
+        other turn it is cleared, so an old draft can never be picked up later.
     """
 
     async def respond(state: AgentState) -> dict:
         incident = state.get("active_incident")
+        draft = None
         if state.get("route") == "incident" and isinstance(incident, dict) and incident.get("id"):
             reply, outcome, citations, usage = incident_reply(incident), "incident", [], {}
         else:
@@ -423,8 +470,10 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
             usage = dict(state.get("usage") or {})
             if outcome == "answered" and not citations:
                 reply, outcome = UNGROUNDED_REPLY, "not_documented"
+            if outcome == "draft_proposed" and isinstance(state.get("draft"), dict):
+                draft = dict(state["draft"])
         reply = safe_reply(reply)
         return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": citations,
-                "outcome": outcome, "usage": usage}
+                "outcome": outcome, "usage": usage, "draft": draft}
 
     return respond

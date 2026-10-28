@@ -25,7 +25,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from langchain_core.messages import HumanMessage, RemoveMessage
+from pydantic import ValidationError
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
@@ -43,7 +44,7 @@ from app.llm import LLMError, OpenRouterChat  # noqa: E402
 from app.mcp_client import HelpdeskMCP  # noqa: E402
 from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, Citation, PendingAction,  # noqa: E402
                          ResetRequest, ToolCall)
-from app.tickets import ROUTING, TICKET_ID, TicketDraft, propose_ticket  # noqa: E402
+from app.tickets import ROUTING, TICKET_ID, TicketDraft, TicketDraftError, propose_ticket  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("helpdesk-app")
@@ -454,6 +455,23 @@ async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResp
         turn.update(token_fields)
     try:
         out = await graph.ainvoke(turn, config)
+        # A ticket draft proposed this turn (Phase 4) becomes a pending action only through propose_draft, which
+        # checks it against the directory and the ticket schema. Nothing is filed here: only /api/approve files.
+        pending_action, draft_calls = None, []
+        if out.get("outcome") == "draft_proposed" and isinstance(out.get("draft"), dict):
+            try:
+                pending_action, draft_calls, failure = await _propose_turn_draft(req.session_id, session,
+                                                                                 out["draft"])
+            except Exception:  # e.g. the database failed while saving the draft (the old draft is restored)
+                log.exception("chat session=%s: the ticket draft could not be saved", session_ref(req.session_id))
+                pending_action, draft_calls, failure = None, [], DRAFT_SAVE_FAILED_REPLY
+            if failure:
+                # The saved reply said a draft was prepared; replace it, so the history never says that falsely.
+                await graph.aupdate_state(config, {
+                    "messages": [AIMessage(content=failure, id=out["messages"][-1].id)],
+                    "reply": failure, "outcome": "error", "draft": None,
+                }, as_node=FINAL_NODE)
+                out = {**out, "reply": failure, "outcome": "error", "draft": None}
         # Instructions aimed at the assistant are answered this turn only, never replayed from the history (V4).
         if looks_like_instructions(message):
             await graph.aupdate_state(config, {"messages": [HumanMessage(content=WITHHELD, id=human.id)]},
@@ -471,15 +489,53 @@ async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResp
         session.update(token_fields)
         send_session_token(response, req.session_id, new_token)
     # The graph's outcome maps onto the contract's existing fields: state (answered | clarify | incident |
-    # not_documented | error), citations (only documents in this turn's evidence, checked by respond) and usage.
+    # not_documented | blocked | error, or await_approval with a pending_action when a draft was stored),
+    # citations (only documents in this turn's evidence, checked by respond) and usage.
     return ChatResponse(
         session_id=req.session_id,
         reply=f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"],
-        state=out.get("outcome") or "error",
+        state="await_approval" if pending_action else (out.get("outcome") or "error"),
+        pending_action=pending_action,
         citations=[Citation(id=c["id"], title=c.get("title") or "") for c in out.get("citations") or []],
-        tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])],
+        tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])] + list(draft_calls),
         usage=out.get("usage") or None,
     )
+
+
+DRAFT_IDENTITY_REPLY = ("I couldn't prepare the ticket draft, because this conversation isn't linked to the work "
+                        "email it is for. Nothing was filed and there is nothing to approve.")
+DRAFT_INVALID_REPLY = ("I couldn't prepare a valid ticket draft: the details didn't pass the ticket checks. Nothing "
+                       "was filed and there is nothing to approve. Please try again, or describe the problem in a "
+                       "bit more detail.")
+DRAFT_SAVE_FAILED_REPLY = ("Sorry, I couldn't save the ticket draft right now. Nothing was filed and there is "
+                           "nothing new to approve. Please try again in a moment.")
+
+
+async def _propose_turn_draft(session_id: str, session: dict,
+                              draft: dict) -> tuple[PendingAction | None, list[ToolCall], str | None]:
+    """Store a draft proposed by the graph as the pending action, or say why not. Call under the session lock.
+
+    Returns (pending_action, tool_calls, failure_reply). Fails closed: the requester must be this conversation's
+    locked email (the graph sets it from there; this checks again, so no model output can ever choose it).
+    """
+    locked = str((session["user"] or {}).get("email") or "").strip().lower()
+    requester = str(draft.get("requester_email") or "").strip().lower()
+    if not locked or requester != locked:
+        log.warning("chat session=%s: ticket draft refused: the requester is not the conversation's email",
+                    session_ref(session_id))
+        return None, [], DRAFT_IDENTITY_REPLY
+    previous = session["pending_action"]
+    try:
+        action, calls = await propose_draft(session_id, TicketDraft(**draft))
+    except (TicketDraftError, ValidationError) as exc:
+        problems = getattr(exc, "problems", None) or ["invalid draft fields"]
+        log.info("chat session=%s: ticket draft not valid (%d problem(s))", session_ref(session_id), len(problems))
+        return None, list(getattr(exc, "tool_calls", [])), DRAFT_INVALID_REPLY
+    except Exception:
+        session["pending_action"] = previous          # never leave an unsaved draft approvable
+        raise
+    log.info("chat session=%s: ticket draft %s waiting for approval", session_ref(session_id), action.action_id)
+    return action, calls, None
 
 
 @app.post("/api/approve", response_model=ChatResponse)

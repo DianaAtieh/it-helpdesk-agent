@@ -90,9 +90,10 @@ def tool_names(out: dict) -> list[str]:
 
 # ------------------------------------------------------------- the graph's shape
 
-def test_the_graph_has_the_phase_2_nodes_and_ends_at_respond():
+def test_the_graph_has_the_phase_2_and_4_nodes_and_ends_at_respond():
     graph, *_ = make()
-    assert list(graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "respond", "__end__"]
+    assert list(graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "escalate", "respond",
+                                             "__end__"]
     assert FINAL_NODE == "respond"
 
 

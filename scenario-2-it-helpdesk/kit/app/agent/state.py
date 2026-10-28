@@ -52,6 +52,11 @@ class AgentState(TypedDict, total=False):
     citations: list[dict]
     outcome: str
     usage: dict
+    # Escalate (Phase 4): a ticket draft PROPOSAL built by app.agent.escalation (TicketDraft-compatible plain
+    # dict), only on the turn it was made (respond clears it on every other turn). It is not a ticket and not
+    # yet a pending action: /api/chat validates and stores it with main.propose_draft; only /api/approve writes.
+    # outcome is then "draft_proposed"; a blocked request is "blocked", a missing step or email "clarify".
+    draft: dict | None
     # This turn's reply text, and this turn's tool calls as {"tool", "ok", "ms"} dicts.
     # No reducer: each turn overwrites them, so they never carry over from the previous turn.
     reply: str
