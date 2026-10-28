@@ -61,17 +61,21 @@ REFUSALS = {
         "Contractors have no VPN access: you work only through the Nakhla Workspace VDI portal at "
         "https://vdi.nakhla.example (SP-002 section 3). If the VDI portal itself doesn't work, tell me what you "
         "see and I can help with that."),
+    "MFA_OPT_OUT": (
+        "I can't help with turning off, skipping or getting an exemption from MFA: it is mandatory for every "
+        "NakhlaID account, including contractors (SP-002 section 1). If NakhlaKey is the problem, for example a "
+        "new phone, tell me what you see; the steps for a new phone are in KB-007."),
 }
 RULE_DOC = {"PHONE_RESET": "SP-001", "ADMIN_CREDENTIAL": "SP-001", "SMS_CODE": "SP-002",
-            "WEAKEN_SECURITY": "SP-002", "CONTRACTOR_VPN": "SP-002"}
+            "WEAKEN_SECURITY": "SP-002", "CONTRACTOR_VPN": "SP-002", "MFA_OPT_OUT": "SP-002"}
 RULE_SECTION = {"PHONE_RESET": "SP-001 section 2", "ADMIN_CREDENTIAL": "SP-001 section 5",
                 "SMS_CODE": "SP-002 section 1", "WEAKEN_SECURITY": "SP-002 section 4",
-                "CONTRACTOR_VPN": "SP-002 section 3"}
+                "CONTRACTOR_VPN": "SP-002 section 3", "MFA_OPT_OUT": "SP-002 section 1"}
 
 
 @dataclass(frozen=True)
 class PolicyHit:
-    rule: str          # PHONE_RESET | ADMIN_CREDENTIAL | SMS_CODE | WEAKEN_SECURITY | CONTRACTOR_VPN
+    rule: str          # PHONE_RESET | ADMIN_CREDENTIAL | SMS_CODE | WEAKEN_SECURITY | CONTRACTOR_VPN | MFA_OPT_OUT
     doc_id: str        # the SP document the rule comes from
     section: str
     reply: str         # the fixed refusal
@@ -117,6 +121,15 @@ def is_prohibition(sentence: str) -> bool:
 _ASK = r"(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+|i\s+(?:need|want)\s+you\s+to\s+"
 _CHANNEL = r"(?:over|by|on|via|through)\s+(?:the\s+)?(?:phone|telephone|chat|e-?mail)"
 
+# SP-002 section 1: MFA is mandatory for every NakhlaID account. Turning it off, skipping it or being exempt
+# from it is never something the desk or this agent may help with (or recommend).
+_MFA = r"(?:mfa|2fa|two[-\s]factor(?:\s+authentication)?|multi[-\s]?factor(?:\s+authentication)?)"
+_MFA_OPT_OUT = (
+    rf"\b(?:disable|turn\s+off|switch\s+off|bypass|skip|get\s+around|get\s+past|waive|opt\s+out\s+of)\s+"
+    rf"(?:the\s+|my\s+|our\s+|all\s+|their\s+|your\s+)?(?:account\s+|nakhlaid\s+)?(?:{_MFA}|nakhlakey(?:\s+prompts?)?)\b"
+    rf"|\b(?:exempt|exemption|exception)\b[^.?!]{{0,30}}\b(?:from\s+)?(?:the\s+)?(?:{_MFA}|nakhlakey)\b"
+    rf"|\b(?:sign|log)\s*in\s+without\s+(?:{_MFA}|nakhlakey)\b")
+
 _REQUESTS: dict[str, re.Pattern] = {
     # SP-001 section 2: the desk does not reset passwords, read out temporary passwords or change MFA devices
     # over the phone, chat or email.
@@ -147,6 +160,7 @@ _REQUESTS: dict[str, re.Pattern] = {
         r"(?:disk\s+encryption|bitlocker|encryption|antivirus|anti-virus|nakhlamanage(?:\s+agent)?)\b"
         r"|\b(?:use|install|connect\s+with)\s+(?:a\s+|an\s+)?(?:another|other|different|my\s+own|own|personal|"
         r"private|third[-\s]party)\s+vpn\b"),
+    "MFA_OPT_OUT": re.compile(r"(?i)" + _MFA_OPT_OUT),
 }
 
 
@@ -190,6 +204,7 @@ _ADVICE: dict[str, re.Pattern] = {
         r"(?i)\b(?:admin(?:istrator)?|local[\s-]?admin|root|service[\s-]?account)\s+(?:account\s+)?password\s+"
         r"(?:is|was|:|=)\s*\S"
         r"|\bpassword\s+for\s+(?:the\s+)?(?:local\s+)?(?:admin(?:istrator)?|root|service)\b[^.]{0,30}\b(?:is|:)\s*\S"),
+    "MFA_OPT_OUT": re.compile(r"(?i)" + _MFA_OPT_OUT),
 }
 
 

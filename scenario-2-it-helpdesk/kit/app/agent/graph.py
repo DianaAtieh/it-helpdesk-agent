@@ -20,6 +20,7 @@ from __future__ import annotations
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
+from app.agent.evidence_eval import make_evaluate
 from app.agent.nodes import (MCPClient, make_answer, make_escalate, make_respond, make_retrieve, make_triage,
                              route_after_retrieve, route_after_triage)
 from app.agent.retrieval import KnowledgeBase
@@ -33,8 +34,11 @@ FINAL_NODE = "respond"
 
 
 def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: KnowledgeBase | None = None,
-                llm: ChatModel | None = None):
-    """kb or llm may be None (not configured, or failed to load): the answer is then an honest error reply."""
+                llm: ChatModel | None = None, evaluate_evidence: bool = False):
+    """kb or llm may be None (not configured, or failed to load): the answer is then an honest error reply.
+
+    evaluate_evidence=True inserts the optional, bounded evidence evaluation (app/agent/evidence_eval.py):
+    retrieve -> evaluate -> answer. Off by default; the graph is then exactly as before."""
     graph = StateGraph(AgentState)
     graph.add_node("triage", make_triage(mcp))
     graph.add_node("retrieve", make_retrieve(kb))
@@ -43,7 +47,12 @@ def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: Knowledge
     graph.add_node(FINAL_NODE, make_respond())
     graph.add_edge(START, "triage")
     graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "retrieve": "retrieve"})
-    graph.add_conditional_edges("retrieve", route_after_retrieve, {"escalate": "escalate", "answer": "answer"})
+    if evaluate_evidence:
+        graph.add_node("evaluate", make_evaluate(kb, llm))
+        graph.add_conditional_edges("retrieve", route_after_retrieve, {"escalate": "escalate", "answer": "evaluate"})
+        graph.add_edge("evaluate", "answer")
+    else:
+        graph.add_conditional_edges("retrieve", route_after_retrieve, {"escalate": "escalate", "answer": "answer"})
     graph.add_edge("answer", FINAL_NODE)
     graph.add_edge("escalate", FINAL_NODE)
     graph.add_edge(FINAL_NODE, END)

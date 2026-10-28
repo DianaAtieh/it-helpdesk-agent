@@ -49,6 +49,13 @@ class AgentState(TypedDict, total=False):
     rule_warnings: list[str]
     rule_coverage: dict[str, str]
     kb_status: str
+    # Evidence evaluation (optional step after retrieve, app/agent/evidence_eval.py; written every turn it runs):
+    #   evaluation        {"decision", "evaluations", "retried", ...}: a trace of the proposal and what code did with it
+    #   evaluation_hold   {"outcome", "reply"} when the evaluator held the answer back (fixed code-written reply)
+    #   evaluation_usage  the evaluator's token counts, added to the answer's usage
+    evaluation: dict
+    evaluation_hold: dict | None
+    evaluation_usage: dict
     # Answer (Phase 2):
     #   citations       [{"id", "title"}], only documents that are in this turn's evidence
     #   outcome         answered | clarify | not_documented | policy_refusal | error

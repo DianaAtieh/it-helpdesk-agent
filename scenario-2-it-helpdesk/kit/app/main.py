@@ -92,7 +92,8 @@ async def lifespan(app: FastAPI):
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
-        app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm)
+        app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm,
+                                      evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"))
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
                  db_path, expired, retention_days())
