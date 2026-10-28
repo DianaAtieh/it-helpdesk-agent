@@ -67,11 +67,17 @@ def apply_priority_rules(priority: str, department: str, affected_users: int) ->
     return priority
 
 
+# Executive Office tickets: the requester's email was given in chat and is not verified (no login). The flag is
+# a review marker for the Service Desk, not a hold; app/agent/escalation.py adds the full notice to the description.
+IDENTITY_SUMMARY_FLAG = "identity not verified"
+
+
 def summarize(payload: dict) -> str:
     """The one line the employee approves: it must say exactly what will be filed."""
     team = ROUTING.get(payload["category"], "IT Service Desk")
+    flag = f" · {IDENTITY_SUMMARY_FLAG}" if payload["department"] == "Executive Office" else ""
     return (f"Ticket draft · {payload['category']} · {payload['priority']} · "
-            f"{payload['department']} → {team}: {payload['subject']}")
+            f"{payload['department']} → {team}{flag}: {payload['subject']}")
 
 
 async def propose_ticket(session: dict, draft: TicketDraft,

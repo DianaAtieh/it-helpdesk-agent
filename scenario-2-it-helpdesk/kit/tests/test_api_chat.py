@@ -171,5 +171,5 @@ def test_the_graph_cannot_write_tickets(client):
     for path in sources:                                                       # writes stay in /api/approve
         source = path.read_text(encoding="utf-8")
         assert "create_ticket" not in source and "add_ticket_note" not in source, path.name
-    assert list(app.state.graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "respond",
-                                                       "__end__"]
+    assert list(app.state.graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "escalate",
+                                                       "respond", "__end__"]

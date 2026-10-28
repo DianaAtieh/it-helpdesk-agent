@@ -1,11 +1,14 @@
-"""The LangGraph workflow (Phase 2):
+"""The LangGraph workflow (Phase 2, plus the Phase 4 escalate branch):
 
-    START -> triage --(a verified active incident)--> respond -> END
-                    \\--(otherwise)--> retrieve -> answer -> respond
+    START -> triage --(a verified active incident)----------------------------> respond -> END
+                    \\--(otherwise)--> retrieve --(a ticket request)--> escalate --> respond
+                                               \\--(otherwise)--------> answer ----> respond
 
   triage    who is asking (directory), the status page (the ONLY status call of a turn), error codes, route
   retrieve  the knowledge base (ingestion's PolicyRetriever), scoped to the directory department
   answer    the one chat-model call: grounded in the evidence, no tools
+  escalate  a ticket draft PROPOSAL (app/agent/escalation.py decides the rules; the model only describes the
+            problem). Taken only for an explicit ticket request, decided in code from the conversation
   respond   the last check on everything that leaves the agent (citations, secrets, ticket IDs)
 
 The checkpointer saves the state after every step, keyed by the thread id the caller passes in
@@ -17,8 +20,8 @@ from __future__ import annotations
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
-from app.agent.nodes import (MCPClient, make_answer, make_respond, make_retrieve, make_triage,
-                             route_after_triage)
+from app.agent.nodes import (MCPClient, make_answer, make_escalate, make_respond, make_retrieve, make_triage,
+                             route_after_retrieve, route_after_triage)
 from app.agent.retrieval import KnowledgeBase
 from app.agent.state import AgentState
 from app.llm import ChatModel
@@ -36,10 +39,12 @@ def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: Knowledge
     graph.add_node("triage", make_triage(mcp))
     graph.add_node("retrieve", make_retrieve(kb))
     graph.add_node("answer", make_answer(llm))
+    graph.add_node("escalate", make_escalate(llm))
     graph.add_node(FINAL_NODE, make_respond())
     graph.add_edge(START, "triage")
     graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "retrieve": "retrieve"})
-    graph.add_edge("retrieve", "answer")
+    graph.add_conditional_edges("retrieve", route_after_retrieve, {"escalate": "escalate", "answer": "answer"})
     graph.add_edge("answer", FINAL_NODE)
+    graph.add_edge("escalate", FINAL_NODE)
     graph.add_edge(FINAL_NODE, END)
     return graph.compile(checkpointer=checkpointer)
