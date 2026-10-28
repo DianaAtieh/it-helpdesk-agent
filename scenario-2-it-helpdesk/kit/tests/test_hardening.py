@@ -16,7 +16,7 @@ import pytest
 
 from app.agent.storage import delete_expired_threads
 from app.main import app, sessions, thread_config
-from tests.helpers import approve, arm_fault, created_tickets, make_draft, propose, requires_api
+from tests.helpers import TURN_RAN, approve, arm_fault, created_tickets, make_draft, propose, requires_api
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -113,7 +113,7 @@ def test_the_history_is_capped_at_the_newest_messages(client, monkeypatch):
     messages = saved(client, "s-1")["messages"]
     assert len(messages) == 6
     assert [m.content for m in messages][::2] == ["message 2", "message 3", "message 4"]
-    assert chat(client, "s-1", "message 5")["state"] == "skeleton"      # the conversation goes on
+    assert chat(client, "s-1", "message 5")["state"] in TURN_RAN      # the conversation goes on
 
 
 def test_storage_grows_linearly_not_quadratically(client):

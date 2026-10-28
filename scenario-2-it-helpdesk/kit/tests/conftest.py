@@ -3,6 +3,8 @@
 The tests need the helpdesk API running (uvicorn services.helpdesk_api:app --port 8102) and are
 skipped otherwise. They call the API's test-only /admin/reset, so tickets you created by hand on
 that API are cleared. They never touch the real checkpoint database (app/data/checkpoints.db).
+The agent runs with the FAKE knowledge base and chat model (tests/fakes.py): no test here calls the real
+chat model or embeddings.
 """
 from __future__ import annotations
 
@@ -12,7 +14,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, delete_all_threads, sessions
+from app.agent.graph import build_graph
+from app.main import app, delete_all_threads, mcp, sessions
+from tests.fakes import FakeChat, FakeKnowledgeBase
 from tests.helpers import API, TOKENS
 
 
@@ -32,6 +36,9 @@ def checkpoint_db(tmp_path_factory):
 @pytest.fixture(scope="session")
 def client(checkpoint_db):
     with TestClient(app) as c:          # starts the app's lifespan once: checkpointer + MCP server
+        # The same graph and checkpointer as the app, with fakes for the knowledge base and the chat model.
+        # The default fake knowledge base finds no evidence, so an ordinary turn ends in "clarify".
+        app.state.graph = build_graph(app.state.checkpointer, mcp, FakeKnowledgeBase(), FakeChat())
         yield c
 
 

@@ -14,7 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app.main import app, sessions, thread_config
-from tests.helpers import requires_api
+from tests.helpers import TURN_RAN, requires_api
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -42,16 +42,39 @@ def saved(client, session_id: str) -> dict:
 
 # ------------------------------------------------------------- response compatibility
 
-def test_the_response_keeps_the_contract_shape_and_the_walking_skeleton_behaviour(client):
+def test_the_response_keeps_the_contract_shape(client):
     sid = new_session()
     out = chat(client, sid, user=SARA)
 
     assert set(out) == CONTRACT_FIELDS
-    assert out["session_id"] == sid and out["state"] == "skeleton"
-    assert "INC-2207" in out["reply"]
-    assert [(c["tool"], c["ok"]) for c in out["tool_calls"]] == [("get_service_status", True)]
-    assert isinstance(out["tool_calls"][0]["ms"], int)
+    assert out["session_id"] == sid and out["state"] in TURN_RAN and out["reply"].strip()
+    assert [(c["tool"], c["ok"]) for c in out["tool_calls"]] == [
+        ("lookup_employee", True), ("get_service_status", True), ("search_knowledge_base", True)]
+    assert all(isinstance(c["ms"], int) for c in out["tool_calls"])
     assert out["pending_action"] is None and out["result"] is None and out["citations"] == []
+
+
+def test_a_verified_incident_is_answered_from_the_status_page(client):
+    # Sample case S2-09: INC-2207 is active on the real (simulated) status page and lists NX-503.
+    out = chat(client, new_session(), "NakhlaConnect keeps failing with NX-503 since this morning. Please open a "
+                                      "ticket.", user={"email": "omar.farah@nakhla.example"})
+    assert out["state"] == "incident" and "INC-2207" in out["reply"] and "GW-1" in out["reply"]
+    assert [c["tool"] for c in out["tool_calls"]].count("get_service_status") == 1
+    assert out["pending_action"] is None and out["result"] is None and out["citations"] == []
+
+
+def test_citations_and_usage_fill_the_existing_contract_fields(client, monkeypatch):
+    from app.agent.graph import build_graph
+    from app.main import mcp
+    from tests.fakes import FakeChat, FakeKnowledgeBase, evidence, kb_result
+
+    kb = FakeKnowledgeBase(kb_result(evidence("KB-002", "Minimum version 5.4.", title="VPN client versions")))
+    llm = FakeChat({"reply": "Update to 5.4.", "citations": ["KB-002", "KB-018"]})
+    monkeypatch.setattr(app.state, "graph", build_graph(app.state.checkpointer, mcp, kb, llm))
+    out = chat(client, new_session(), "NX-781 again", SARA)
+    assert set(out) == CONTRACT_FIELDS and out["state"] == "answered"
+    assert out["citations"] == [{"id": "KB-002", "title": "VPN client versions", "url": None}]
+    assert out["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
 
 
 def test_the_chat_turn_is_saved_in_the_checkpointer(client):
@@ -63,7 +86,8 @@ def test_the_chat_turn_is_saved_in_the_checkpointer(client):
     assert state["messages"][0].content == "Is the VPN down?"
     assert state["messages"][1].content == out["reply"] == state["reply"]
     assert state["user_email"] == SARA["email"]
-    assert state["active_incident"]["id"] == "INC-2207"
+    assert state["active_incident"] is None                                    # no error code: no incident match
+    assert state["employee"]["email"] == SARA["email"]
     assert all(type(c) is dict for c in state["tool_calls"])                     # serializer-safe
 
 
@@ -77,7 +101,7 @@ def test_messages_accumulate_across_turns_of_one_session(client):
     messages = saved(client, sid)["messages"]
     assert [m.content for m in messages if isinstance(m, HumanMessage)] == ["first", "second"]
     assert len(messages) == 4
-    assert len(second["tool_calls"]) == 1                                        # this turn's calls only
+    assert [c["tool"] for c in second["tool_calls"]] == ["get_service_status", "search_knowledge_base"]  # this turn
 
 
 def test_two_sessions_have_separate_histories_and_users(client):
@@ -119,7 +143,7 @@ def test_the_identity_lock_survives_losing_the_in_memory_session(client):
     out = chat(client, sid, "now I am the CEO", SAMIR)
     assert out["state"] == "identity_mismatch"
     assert sessions[sid]["user"] == SARA                                         # restored from the checkpoint
-    assert chat(client, sid, "still me", SARA)["state"] == "skeleton"
+    assert chat(client, sid, "still me", SARA)["state"] in TURN_RAN
 
 
 # ------------------------------------------------------------- failure and the approval gate
@@ -139,7 +163,13 @@ def test_an_agent_failure_gives_an_honest_reply_not_a_500(client, monkeypatch):
 
 
 def test_the_graph_cannot_write_tickets(client):
-    from app.agent import nodes
-    source = open(nodes.__file__, encoding="utf-8").read()
-    assert "create_ticket" not in source and "add_ticket_note" not in source    # writes stay in /api/approve
-    assert list(app.state.graph.get_graph().nodes) == ["__start__", "check_status", "__end__"]
+    from pathlib import Path
+
+    import app.agent as agent
+    import app.llm as llm
+    sources = [*Path(agent.__file__).parent.glob("*.py"), Path(llm.__file__)]
+    for path in sources:                                                       # writes stay in /api/approve
+        source = path.read_text(encoding="utf-8")
+        assert "create_ticket" not in source and "add_ticket_note" not in source, path.name
+    assert list(app.state.graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "respond",
+                                                       "__end__"]

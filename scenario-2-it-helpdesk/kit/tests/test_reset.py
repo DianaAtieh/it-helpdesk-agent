@@ -9,7 +9,8 @@ from __future__ import annotations
 import pytest
 
 from app.main import app, sessions, thread_config
-from tests.helpers import approve, created_tickets, make_draft, propose, requires_api, token_headers
+from tests.helpers import (TURN_RAN, approve, created_tickets, make_draft, propose, requires_api,
+                           token_headers)
 
 pytestmark = [requires_api, pytest.mark.usefixtures("clean")]
 
@@ -56,7 +57,7 @@ def test_after_reset_the_same_session_id_can_be_used_by_another_employee(client)
 
     reset_one(client, "s-1", SARA)
     out = chat(client, "s-1", "I am the CEO", SAMIR)
-    assert out["state"] == "skeleton"
+    assert out["state"] in TURN_RAN
     state = saved(client, "s-1")
     assert state["user_email"] == SAMIR["email"]
     assert [m.content for m in state["messages"]][::2] == ["I am the CEO"]   # nothing left from Sara
@@ -79,7 +80,7 @@ def test_reset_deletes_a_conversation_that_is_only_on_disk(client):
 
     reset_one(client, "s-1", SARA)
     assert saved(client, "s-1") == {}
-    assert chat(client, "s-1", "hello", SAMIR)["state"] == "skeleton"        # the old identity is gone
+    assert chat(client, "s-1", "hello", SAMIR)["state"] in TURN_RAN        # the old identity is gone
 
 
 def test_reset_of_an_unknown_session_is_harmless(client):
@@ -138,4 +139,4 @@ def test_reset_all_deletes_every_saved_conversation_even_ones_not_in_memory(clie
     assert r.json() == {"status": "ok", "reset": "all", "sessions_cleared": 1, "threads_deleted": 2}
     assert saved(client, "s-1") == {} and saved(client, "s-2") == {}
     assert len(sessions) == 0
-    assert chat(client, "s-1", "fresh", SAMIR)["state"] == "skeleton"        # the ids are free again
+    assert chat(client, "s-1", "fresh", SAMIR)["state"] in TURN_RAN        # the ids are free again

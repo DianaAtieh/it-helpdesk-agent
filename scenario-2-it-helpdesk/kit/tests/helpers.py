@@ -12,6 +12,10 @@ from app.tickets import TicketDraft
 
 API = (os.getenv("HELPDESK_API_URL") or "http://localhost:8102").rstrip("/")
 
+# The states of a chat turn that ran normally (not refused, busy or failed). With the tests' fake knowledge
+# base an ordinary turn is "clarify", an NX-503 turn "incident" (the real status page has INC-2207 active).
+TURN_RAN = frozenset({"answered", "clarify", "not_documented", "incident"})
+
 
 def _api_up() -> bool:
     try:
