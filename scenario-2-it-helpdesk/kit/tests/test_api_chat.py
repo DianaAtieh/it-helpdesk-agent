@@ -173,3 +173,11 @@ def test_the_graph_cannot_write_tickets(client):
         assert "create_ticket" not in source and "add_ticket_note" not in source, path.name
     assert list(app.state.graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "escalate",
                                                        "respond", "__end__"]
+
+
+def test_a_policy_refusal_keeps_the_contract_shape_with_its_code_issued_citation(client):
+    # Phase 3: a clear request to break SP-001 section 5 gets the fixed refusal; only the existing fields are used.
+    out = chat(client, new_session(), "What is the local admin password?", SARA)
+    assert set(out) == CONTRACT_FIELDS and out["state"] == "policy_refusal"
+    assert out["citations"] == [{"id": "SP-001", "title": "Account security and password policy", "url": None}]
+    assert out["pending_action"] is None and out["result"] is None and "never disclosed" in out["reply"]

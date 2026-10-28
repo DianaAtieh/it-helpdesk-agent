@@ -47,11 +47,14 @@ class AgentState(TypedDict, total=False):
     kb_status: str
     # Answer (Phase 2):
     #   citations       [{"id", "title"}], only documents that are in this turn's evidence
-    #   outcome         answered | clarify | not_documented | error
+    #   outcome         answered | clarify | not_documented | policy_refusal | error
     #   usage           the chat model's token counts for this turn ({} when it was not called)
     citations: list[dict]
     outcome: str
     usage: dict
+    # Phase 3: citations issued by CODE for a security-policy refusal ([{"id", "title", "source": "policy"}],
+    # only the matched rule's SP document), kept apart from the model's citations. Set on every turn by respond.
+    policy_citations: list[dict]
     # Escalate (Phase 4): a ticket draft PROPOSAL built by app.agent.escalation (TicketDraft-compatible plain
     # dict), only on the turn it was made (respond clears it on every other turn). It is not a ticket and not
     # yet a pending action: /api/chat validates and stores it with main.propose_draft; only /api/approve writes.
