@@ -47,9 +47,9 @@ def tool_calls(monkeypatch) -> list[str]:
     seen: list[str] = []
     real = main.mcp.call
 
-    async def spy(tool, args=None):
+    async def spy(tool, args=None, **kwargs):
         seen.append(tool)
-        return await real(tool, args)
+        return await real(tool, args, **kwargs)
 
     monkeypatch.setattr(main.mcp, "call", spy)
     return seen

@@ -625,7 +625,8 @@ async def _approve(req: ApproveRequest, session: dict, token: str | None) -> Cha
         )
 
     # Exactly the approved payload, with the action id as the idempotency key.
-    data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id})
+    data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id},
+                                approved=True)
     ticket_id = str((data.get("ticket") or {}).get("ticket_id", "")) if data.get("ok") else ""
 
     if data.get("ok") and TICKET_ID.fullmatch(ticket_id):

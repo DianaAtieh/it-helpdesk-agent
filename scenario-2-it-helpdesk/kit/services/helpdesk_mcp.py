@@ -13,8 +13,10 @@ The knowledge base is NOT exposed here: retrieval over dataset/knowledge_base is
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -22,14 +24,40 @@ from mcp.server.fastmcp import FastMCP
 KIT = Path(__file__).resolve().parent.parent
 
 
-def _load_dotenv() -> None:
-    env = KIT / ".env"
+ENV_PREFIX = "HELPDESK_"   # the only .env keys this server needs; other secrets stay out of its process
+EMAIL_RE = re.compile(r"[a-z0-9._-]+@nakhla\.example")
+TICKET_ID_RE = re.compile(r"IT-\d{4}")
+
+
+def _load_dotenv(env: Path | None = None) -> None:
+    env = env or KIT / ".env"
     if env.is_file():
         for line in env.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+                key = key.strip()
+                if key.startswith(ENV_PREFIX):
+                    os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+
+
+def _valid_email(value: str) -> str | None:
+    """The normalised work email, or None. Same shape as the ticket schema's requester_email."""
+    email = value.strip().lower() if isinstance(value, str) else ""
+    return email if EMAIL_RE.fullmatch(email) else None
+
+
+def _valid_ticket_id(value: str) -> str | None:
+    ticket_id = value.strip().upper() if isinstance(value, str) else ""
+    return ticket_id if TICKET_ID_RE.fullmatch(ticket_id) else None
+
+
+def _path_segment(value: str) -> str:
+    return quote(value, safe="@")   # "/", "%" and ".." can never survive; "@" is kept so the directory route is unchanged
+
+
+def _invalid(field: str, what: str) -> dict:
+    return _fail({"code": "invalid_argument", "message": f"{field} must be {what}."})
 
 
 _load_dotenv()
@@ -86,7 +114,10 @@ async def lookup_employee(email: str) -> dict:
     these from the conversation. Returns {"ok": true, "employee": {...}} or
     {"ok": false, "error": {"code": "employee_not_found", ...}}.
     """
-    ok, data = await _call("GET", f"/api/directory/{email.strip()}")
+    address = _valid_email(email)
+    if address is None:
+        return _invalid("email", "a work email like name.surname@nakhla.example")
+    ok, data = await _call("GET", f"/api/directory/{_path_segment(address)}")
     return {"ok": True, "employee": data} if ok else _fail(data)
 
 
@@ -155,7 +186,10 @@ async def get_ticket(ticket_id: str) -> dict:
     Use it when the employee asks about a specific ticket, or to confirm a ticket you created.
     Returns {"ok": true, "ticket": {...}} or {"ok": false, "error": {"code": "ticket_not_found", ...}}.
     """
-    ok, data = await _call("GET", f"/api/tickets/{ticket_id.strip()}")
+    ticket = _valid_ticket_id(ticket_id)
+    if ticket is None:
+        return _invalid("ticket_id", "a ticket id like IT-1033")
+    ok, data = await _call("GET", f"/api/tickets/{_path_segment(ticket)}")
     return {"ok": True, "ticket": data} if ok else _fail(data)
 
 
@@ -167,7 +201,10 @@ async def add_ticket_note(ticket_id: str, note: str) -> dict:
     search_tickets or get_ticket first) and treat it like any other write in your approval flow.
     Never use it to create a ticket. Returns {"ok": true, "ticket_id": ..., "note": {...}}.
     """
-    ok, data = await _call("POST", f"/api/tickets/{ticket_id.strip()}/notes", body={"note": note})
+    ticket = _valid_ticket_id(ticket_id)
+    if ticket is None:
+        return _invalid("ticket_id", "a ticket id like IT-1033")
+    ok, data = await _call("POST", f"/api/tickets/{_path_segment(ticket)}/notes", body={"note": note})
     return {"ok": True, **data} if ok else _fail(data)
 
 
