@@ -57,6 +57,8 @@ class DataMCP:
             record = DIRECTORY.get(args["email"])
             data = ({"ok": True, "employee": record} if record
                     else {"ok": False, "error": {"code": "employee_not_found"}})
+        elif tool == "search_tickets":                  # memory: no open tickets (read-only tool)
+            data = {"ok": True, "tickets": [], "count": 0, "total_matches": 0}
         else:
             raise AssertionError(f"the graph must never call {tool}")
         return data, ToolCall(tool=tool, ok=bool(data.get("ok")), ms=1)
@@ -95,9 +97,9 @@ def test_an_explicit_request_proposes_a_draft_in_the_state_and_files_nothing():
                             "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "kb_refs": ["KB-002"],
                             "affected_users": 1}
     assert systems(llm) == ["escalate"]                                         # one model call, no answer call
-    assert set(mcp.calls) <= {"lookup_employee", "get_service_status"}         # never create_ticket
+    assert set(mcp.calls) <= {"lookup_employee", "get_service_status", "search_tickets"}  # never create_ticket
     assert [c["tool"] for c in out["tool_calls"]] == ["lookup_employee", "get_service_status",
-                                                      "search_knowledge_base"]
+                                                      "search_knowledge_base", "search_tickets"]
     assert json.loads(json.dumps(out["draft"])) == out["draft"]                 # checkpoint-safe
 
 

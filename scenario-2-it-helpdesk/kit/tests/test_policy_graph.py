@@ -49,6 +49,8 @@ class DataMCP:
             data = {"ok": True, "employee": DIRECTORY[args["email"]]}
         elif tool == "lookup_employee":
             data = {"ok": False, "error": {"code": "employee_not_found"}}
+        elif tool == "search_tickets":                  # memory: no open tickets (read-only tool)
+            data = {"ok": True, "tickets": [], "count": 0, "total_matches": 0}
         else:
             raise AssertionError(f"the graph must never call {tool}")
         return data, ToolCall(tool=tool, ok=bool(data.get("ok")), ms=1)

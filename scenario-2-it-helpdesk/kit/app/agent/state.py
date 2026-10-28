@@ -55,6 +55,11 @@ class AgentState(TypedDict, total=False):
     # Phase 3: citations issued by CODE for a security-policy refusal ([{"id", "title", "source": "policy"}],
     # only the matched rule's SP document), kept apart from the model's citations. Set on every turn by respond.
     policy_citations: list[dict]
+    # Memory (set by escalate on ticket-request turns): the requester's OPEN tickets from search_tickets, reduced to
+    # [{"codes": [...], "keywords": [...]}] (escalation.history_signals): never a ticket ID, subject, description,
+    # note or email. history_checked is False when the lookup failed or was not made (then no duplicate check).
+    open_ticket_signals: list[dict]
+    history_checked: bool
     # Escalate (Phase 4): a ticket draft PROPOSAL built by app.agent.escalation (TicketDraft-compatible plain
     # dict), only on the turn it was made (respond clears it on every other turn). It is not a ticket and not
     # yet a pending action: /api/chat validates and stores it with main.propose_draft; only /api/approve writes.

@@ -39,7 +39,7 @@ def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: Knowledge
     graph.add_node("triage", make_triage(mcp))
     graph.add_node("retrieve", make_retrieve(kb))
     graph.add_node("answer", make_answer(llm))
-    graph.add_node("escalate", make_escalate(llm))
+    graph.add_node("escalate", make_escalate(llm, mcp))
     graph.add_node(FINAL_NODE, make_respond())
     graph.add_edge(START, "triage")
     graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "retrieve": "retrieve"})

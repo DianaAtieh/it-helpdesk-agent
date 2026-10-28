@@ -337,7 +337,7 @@ def route_after_retrieve(state: AgentState) -> str:
     return "escalate" if escalation.wants_ticket(state.get("messages") or []) else "answer"
 
 
-def make_escalate(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]]:
+def make_escalate(llm: ChatModel | None, mcp: MCPClient | None = None) -> Callable[[AgentState], Awaitable[dict]]:
     """Prepare a ticket draft PROPOSAL in the state. It never files, approves or sends anything.
 
     Order: the deterministic blockers first (no identity, no directory record, a Contractor VPN request), with
@@ -360,19 +360,41 @@ def make_escalate(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dic
         refused = policy.check_request(text, state.get("employee"), state.get("codes") or [])
         if refused and refused.rule != "PHONE_RESET":
             return {**result(refused.reply, "policy_refusal"), "policy_citations": [refused.citation]}
+
+        # Memory: the requester's OPEN tickets (search_tickets), only for the directory-confirmed email, only to
+        # avoid a duplicate. Fail-open on purpose: if the lookup fails, the draft is still proposed, and nothing is
+        # ever filed without the employee's approval in /api/approve. Nothing from the history reaches the model or
+        # the reply; the log has counts and booleans only.
+        calls = list(state.get("tool_calls") or [])
+        signals: list[dict] = []
+        checked = False
+        email = (state.get("employee") or {}).get("email")
+        if mcp is not None and email:
+            data, call = await mcp.call("search_tickets", {"requester_email": email, "status": "open",
+                                                           "limit": escalation.MAX_OPEN_TICKETS})
+            calls.append(call.model_dump())
+            checked = bool(data.get("ok"))
+            signals = escalation.history_signals(data.get("tickets")) if checked else []
+        duplicate = checked and escalation.open_duplicate(
+            signals, escalation.duplicate_text(state.get("messages") or []), state.get("codes") or [])
+        log.info("memory: open_tickets=%d history_checked=%s duplicate=%s", len(signals), checked, duplicate)
+        memory = {"open_ticket_signals": signals, "history_checked": checked, "tool_calls": calls}
+        if duplicate:
+            return {**result(escalation.DUPLICATE_REPLY, "blocked"), **memory}
+
         if llm is None:
-            return result(escalation.ESCALATION_FAILED_REPLY, "error")
+            return {**result(escalation.ESCALATION_FAILED_REPLY, "error"), **memory}
         try:
             out = await llm.complete_json(ESCALATION_SYSTEM_PROMPT, build_escalation_input(state, text))
         except LLMError:
-            return result(escalation.ESCALATION_FAILED_REPLY, "error")
+            return {**result(escalation.ESCALATION_FAILED_REPLY, "error"), **memory}
         outcome = escalation.build_draft(out.data, state, text)
         if outcome.kind == "draft":
-            return result(escalation.draft_reply(outcome.draft, state.get("employee")), "draft_proposed",
-                          outcome.draft, out.usage)
+            return {**result(escalation.draft_reply(outcome.draft, state.get("employee")), "draft_proposed",
+                             outcome.draft, out.usage), **memory}
         if outcome.kind == "ask_steps":
-            return result(outcome.reply, "clarify", usage=out.usage)
-        return result(outcome.reply, "blocked", usage=out.usage)
+            return {**result(outcome.reply, "clarify", usage=out.usage), **memory}
+        return {**result(outcome.reply, "blocked", usage=out.usage), **memory}
 
     return escalate
 
