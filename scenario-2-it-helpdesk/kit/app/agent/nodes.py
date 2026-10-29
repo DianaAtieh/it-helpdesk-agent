@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from contextlib import aclosing
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -15,7 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_config, get_stream_writer
 
 from app import timing  # noqa: E402
-from app.agent import access, escalation, policy
+from app.agent import access, answer_verifier, escalation, policy
 from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
@@ -849,6 +850,15 @@ def employee_messages(state: AgentState) -> str:
     return "\n".join(str(m.content) for m in state.get("messages") or [] if isinstance(m, HumanMessage))
 
 
+def add_usage(first: dict, second: dict) -> dict:
+    """Token counts of two model calls added up (the answer and the AI verifier), for the response's usage."""
+    total = dict(first or {})
+    for key, value in (second or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+    return total
+
+
 FINANCE_VPN_OUTCOME = "finance_vpn"
 DEPARTMENT_RULE_SOURCE = "department_rule"
 FINANCE_VPN_DOCS = {"KB-002": "NakhlaConnect VPN: error codes and fixes",
@@ -880,12 +890,15 @@ def valid_policy_citations(raw) -> list[dict]:
     return list({c["id"]: c for c in out}.values())
 
 
-def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
+def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState], Awaitable[dict]]:
     """The node that ends every turn (FINAL_NODE): one place that checks what leaves the agent.
 
       * a verified active incident gets the status-page template (no citations, no model);
       * otherwise the answer node's reply: citations kept only if they are documents in THIS turn's evidence,
         and an "answered" reply left with no valid citation is replaced by the honest fallback;
+      * with verifier_llm (build_graph(verify_answers=True)), a model-written answer that passed every code check
+        is also judged by the AI verifier (app/agent/answer_verifier.py): it may only drop whole sentences or ask
+        for the fallback; if it is unavailable or invalid, the code-verified answer stands. Never for fixed replies;
       * always: secrets redacted, invented ticket IDs and "ticket created" claims removed, non-empty, bounded;
       * a ticket draft proposal survives only on the turn escalate made it (outcome "draft_proposed"); on every
         other turn it is cleared, so an old draft can never be picked up later.
@@ -895,6 +908,8 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         incident = state.get("active_incident")
         draft = None
         policy_citations: list[dict] = []
+        tool_calls = list(state.get("tool_calls") or [])   # this turn's calls so far; the AI verifier adds its own
+        verification: dict | None = None
         if state.get("route") == "incident" and isinstance(incident, dict) and incident.get("id"):
             reply, outcome, citations, usage = incident_reply(incident), "incident", [], {}
         elif state.get("route") == "status":
@@ -934,6 +949,22 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
                     log.info("preferences: removed %d preference-saving claim(s) from the model answer", claims)
                     if not reply.strip():                   # the answer was nothing but the claim
                         reply, outcome, citations = preference_reply(state), "preference", []
+            if outcome == "answered" and verifier_llm is not None:   # the AI verifier, after every code check
+                started = time.perf_counter()
+                judged = await answer_verifier.verify_with_llm(
+                    verifier_llm, reply, evidence=list(state.get("evidence") or []), employee=state.get("employee"),
+                    rule_coverage=state.get("rule_coverage"), employee_message=latest_user_text(state),
+                    fallback_reply=UNGROUNDED_REPLY, citations=citations)
+                tool_calls.append({"tool": answer_verifier.VERIFY_TOOL, "ok": judged.applied,
+                                   "ms": round((time.perf_counter() - started) * 1000)})
+                verification = {"applied": judged.applied, "fallback": judged.fallback, "checked": judged.checked,
+                                "removed": len(judged.removed), "groundedness": judged.groundedness,
+                                "reason": judged.reason, "verdicts": dict(judged.verdicts)}   # counts only, no text
+                usage = add_usage(usage, judged.usage)
+                if judged.applied:                          # citations of only dropped sentences are gone too
+                    reply, citations = judged.reply, judged.citations
+                    if judged.fallback:                     # the honest fallback cites nothing
+                        outcome, citations = "not_documented", []
             if outcome == "policy_refusal" and not policy_citations:
                 policy_citations = valid_policy_citations(state.get("policy_citations"))
             if outcome == access.OUTCOME:                   # code-issued KB-008 / KB-011 citations only
@@ -949,7 +980,11 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         writer = stream_writer(config)
         if writer:                  # the authoritative end of a streamed turn: replaces any provisional chunks
             writer(final_event(reply, shown, outcome))
-        return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
-                "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft}
+        out = {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
+               "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft,
+               "answer_verification": verification}
+        if verification is not None:                # only a verified turn changes this turn's tool calls
+            out["tool_calls"] = tool_calls
+        return out
 
     return respond

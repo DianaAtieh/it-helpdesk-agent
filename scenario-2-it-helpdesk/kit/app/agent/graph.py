@@ -53,17 +53,20 @@ def timed(name: str, node):
 
 
 def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: KnowledgeBase | None = None,
-                llm: ChatModel | None = None, evaluate_evidence: bool = False):
+                llm: ChatModel | None = None, evaluate_evidence: bool = False, verify_answers: bool = False):
     """kb or llm may be None (not configured, or failed to load): the answer is then an honest error reply.
 
     evaluate_evidence=True inserts the optional, bounded evidence evaluation (app/agent/evidence_eval.py):
-    retrieve -> evaluate -> answer. Off by default; the graph is then exactly as before."""
+    retrieve -> evaluate -> answer. Off by default; the graph is then exactly as before.
+
+    verify_answers=True lets the respond node ask the same model to judge each model-written answer after every
+    code check (app/agent/answer_verifier.py). Off by default: no extra model call, the graph as before."""
     graph = StateGraph(AgentState)
     graph.add_node("triage", timed("triage", make_triage(mcp)))
     graph.add_node("retrieve", timed("retrieve", make_retrieve(kb)))
     graph.add_node("answer", timed("answer", make_answer(llm)))
     graph.add_node("escalate", timed("escalate", make_escalate(llm, mcp)))
-    graph.add_node(FINAL_NODE, timed("respond", make_respond()))
+    graph.add_node(FINAL_NODE, timed("respond", make_respond(llm if verify_answers else None)))
     graph.add_edge(START, "triage")
     graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "status": FINAL_NODE, "preference": FINAL_NODE, "retrieve": "retrieve"})
     if evaluate_evidence:
