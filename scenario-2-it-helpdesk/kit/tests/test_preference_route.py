@@ -37,6 +37,9 @@ SAVED_UI = {"verbosity": "short", "format": "bullets"}
     "Please remember that I prefer detailed answers in English.",
     "Remember that I prefer short answers. From now on, use numbered steps.",
     "From now on, keep answers brief\nand always use bullet points.",
+    "I prefer short answers.",                              # a clear first-person statement about answers
+    "I want shorter answers, with bullet points",
+    "From now on, answer in bullet points.",
 ])
 def test_clear_persistent_preference_requests_are_preference_only(text):
     assert is_preference_only(text) is True
@@ -46,7 +49,6 @@ def test_clear_persistent_preference_requests_are_preference_only(text):
 @pytest.mark.parametrize("text", [
     "",
     "   ",
-    "I prefer short answers.",                              # nothing says it lasts
     "For this answer, keep it short.",                      # temporary
     "Explain this one in English.",                         # temporary
     "From now on, don't use bullet points.",                # negated
@@ -204,7 +206,9 @@ def test_http_with_no_store_the_reply_claims_nothing(env, monkeypatch):
     client = env.use(llm_http(), FakeKnowledgeBase(kb_result(KB002)))
     monkeypatch.setattr(app_main.app.state, "preferences", None)
     data = chat(client, sid(), FAILED_UI_MESSAGE).json()
-    assert data["reply"] == PREFERENCE_REPLY and "Saved" not in data["reply"]
+    # Nothing could be stored, and the reply says so instead of leaving the fixed acknowledgement on its own.
+    assert data["reply"].startswith(PREFERENCE_REPLY) and "Saved" not in data["reply"]
+    assert app_main.PREFERENCES_UNAVAILABLE_NOTE in data["reply"]
 
 
 def test_http_without_an_email_nothing_is_saved_and_no_confirmation_is_shown(env):

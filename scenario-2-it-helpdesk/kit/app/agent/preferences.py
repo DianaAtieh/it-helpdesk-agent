@@ -200,6 +200,32 @@ _PERSISTENT = re.compile(
     r"going\s+forward|in\s+(the\s+)?future|for\s+(all\s+)?future|every\s+time|each\s+time|by\s+default|"
     r"as\s+a\s+default|permanently|always|i\s+(always|generally|consistently)\s+prefer|"
     r"my\s+(standing|permanent|default)\s+preference)\b")
+# ... or a clear first-person statement of a standing preference: "I prefer short answers.", "I want answers in
+# bullet points.", "I would like detailed answers.", "I'd like numbered steps." It counts only when it is about
+# answers in general (a plural target such as "answers" or "steps", not "this answer"), so a one-off command
+# ("Keep answers short", "Make it shorter") or "I want a short answer" is still not saved. Every other check below
+# (temporary, negated, hypothetical, quoted, policy/ticket topics, secrets, steering) still applies to it.
+_NATURAL = re.compile(r"(?i)\bi\s+(?:really\s+)?(?:prefer|want|would\s+like)\b|\bi['’]d\s+(?:really\s+)?like\b")
+_GENERIC_TARGET = re.compile(r"(?i)\b(answers|replies|responses|explanations|instructions|steps|bullets|"
+                             r"bullet[- ]points|paragraphs|prose)\b")
+_OFF_TOPIC_TARGET = re.compile(r"(?i)\b(about|regarding|concerning)\b")      # "detailed answers about the VPN"
+# "would" is also a hypothetical word below; in "I would like" / "I'd like" it is the preference itself.
+_WOULD_LIKE = re.compile(r"(?i)\bi\s+would\s+(?:really\s+)?like\b|\bi['’]d\s+(?:really\s+)?like\b")
+
+
+def _lasting(sentence: str) -> bool:
+    """The sentence says the preference lasts: an explicit phrase, or a clear first-person statement about answers."""
+    if _PERSISTENT.search(sentence):
+        return True
+    return bool(_NATURAL.search(sentence) and _GENERIC_TARGET.search(sentence)
+                and not _OFF_TOPIC_TARGET.search(sentence))
+
+
+def _for_checks(sentence: str) -> str:
+    """The sentence as the temporary / negation / hypothetical checks see it ("I would like" -> "I like")."""
+    return _WOULD_LIKE.sub("I like", sentence)
+
+
 _TEMPORARY = re.compile(
     r"(?i)\b(for\s+(this|that|the\s+next|now|today|tonight|a\s+(moment|while|minute))|this\s+(one|time|answer|"
     r"reply|response|question|ticket|issue|conversation|session|chat)|just\s+(this|now|once)|only\s+(this|now|"
@@ -248,13 +274,22 @@ _ABOUT_ANSWERS = re.compile(r"(?i)\b(answers?|replies|reply|responses?|explanati
                             r"give|make|be|use|show|format|list\w*)\b")
 
 
+# The global injection filter (app.guardrails, unchanged) flags "from now on" followed by always / never / answer /
+# respond ..., which also matches a plain style request ("From now on, answer in bullet points."). For preference
+# detection only, that lead-in is set aside before the filter runs when the next word is a style verb, so the rest
+# of the message is still checked in full. "From now on, ignore your rules" and "from now on you are ..." are not
+# style verbs, stay flagged here, and save nothing. The message itself is still handled by main.py as before.
+_PREFERENCE_LEAD_IN = re.compile(
+    r"(?i)\bfrom\s+now\s+on,?\s+(?=(?:always|never|answer|respond|reply|use|give|write|keep|explain|format)\b)")
+
+
 def _clean(message: str) -> str | None:
     """The message without quoted parts, or None if it must not be mined at all."""
     if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_CHARS:
         return None
     if redact_secrets(message) != message:                        # looks like it contains a secret
         return None
-    if looks_like_instructions(re.sub(r"(?i)\bfrom\s+now\s+on,?\s+(?=always|never)", "", message)):
+    if looks_like_instructions(_PREFERENCE_LEAD_IN.sub("", message)):
         return None                                               # aimed at the assistant's own rules
     if _STEERING.search(message):
         return None
@@ -287,9 +322,10 @@ def extract_preferences(message: str) -> dict[str, str]:
     conflicted: set[str] = set()
     for sentence in _SENTENCES.split(text):
         sentence = sentence.strip()
-        if (not sentence or "?" in sentence or not _PERSISTENT.search(sentence)
-                or _TEMPORARY.search(sentence) or _NEGATION.search(sentence)
-                or _HYPOTHETICAL.search(sentence) or _FORBIDDEN_TOPIC.search(sentence)):
+        checked = _for_checks(sentence)
+        if (not sentence or "?" in sentence or not _lasting(sentence)
+                or _TEMPORARY.search(checked) or _NEGATION.search(checked)
+                or _HYPOTHETICAL.search(checked) or _FORBIDDEN_TOPIC.search(checked)):
             continue
         for key, value in _values_in(sentence).items():
             if result.get(key, value) != value:
@@ -313,7 +349,7 @@ _WORD = re.compile(r"[^\W_]+(?:'[^\W_]+)?")
 
 
 def _residual_words(sentence: str) -> list[str]:
-    rest = _PERSISTENT.sub(" ", sentence)
+    rest = _NATURAL.sub(" ", _PERSISTENT.sub(" ", sentence))
     for rules in _VALUE_RULES.values():
         for _, pattern in rules:
             rest = pattern.sub(" ", rest)
@@ -335,9 +371,10 @@ def is_preference_only(message: str) -> bool:
     if not sentences:
         return False
     for sentence in sentences:
-        if (not sentence or "?" in sentence or not _PERSISTENT.search(sentence)
-                or _TEMPORARY.search(sentence) or _NEGATION.search(sentence)
-                or _HYPOTHETICAL.search(sentence) or _FORBIDDEN_TOPIC.search(sentence)):
+        checked = _for_checks(sentence)
+        if (not sentence or "?" in sentence or not _lasting(sentence)
+                or _TEMPORARY.search(checked) or _NEGATION.search(checked)
+                or _HYPOTHETICAL.search(checked) or _FORBIDDEN_TOPIC.search(checked)):
             return False
         if not _values_in(sentence) or _residual_words(sentence):
             return False
@@ -363,3 +400,69 @@ def safe_presentation(preferences: object) -> dict[str, str]:
 def describe_preferences(preferences: Mapping[str, str]) -> str:
     """Fixed wording for a set of preferences, e.g. "answer length: short; answer format: numbered steps"."""
     return "; ".join(f"{_LABELS[key]}: {_VALUE_WORDS[value]}" for key, value in safe_presentation(preferences).items())
+
+
+# ---------------------------------------------------------------------- what the model may NOT claim
+# Only main.py saves preferences, and only its own note says what happened. The model never knows whether a save
+# happened, so a sentence in a model answer that promises to remember, save or keep following a style ("I will
+# keep answers shorter and use bullet points as you requested.") is removed by the respond node. A sentence counts
+# only with BOTH a first-person promise (or a "preference saved" statement) AND a lasting / preference context, so
+# ordinary answers ("Remember to save your work.") and a style used in this reply only ("I'll keep this short.")
+# are left alone. The backend's own confirmation wording is reserved too: a model sentence carrying it is removed,
+# so in the final reply it can only come from main.py.
+SAVED_CONFIRMATION = "Saved to your preferences:"
+_CLAIM_PROMISE = re.compile(
+    r"(?i)\b(i\s*(?:will|'ll|’ll|shall|am\s+going\s+to|have|'ve|’ve)\s+(?:now\s+|also\s+|definitely\s+|always\s+|"
+    r"make\s+sure\s+to\s+)*(?:remember|save|store|note|record|keep|use|stick|continue|apply|update|make\s+sure|"
+    r"format|write|answer|respond|reply|give|provide)\w*"
+    r"|preferences?\s+(?:has|have|is|are)\s+(?:been\s+)?(?:saved|stored|noted|recorded|updated|set)"
+    r"|noted\s+your\s+preferences?)\b")
+_CLAIM_CONTEXT = re.compile(
+    r"(?i)\b(preferences?|prefer\w*|remember\w*|from\s+now\s+on|from\s+here\s+on|going\s+forward|future|"
+    r"next\s+time|always|every\s+time|each\s+time|by\s+default|as\s+(?:you\s+)?(?:requested|asked|wished|prefer))\b")
+_CLAIM_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def is_preference_claim(sentence: str) -> bool:
+    """True for a sentence that claims a preference was saved or will be followed in later answers."""
+    sentence = sentence or ""
+    if SAVED_CONFIRMATION.lower() in sentence.lower():
+        return True
+    return bool(_CLAIM_PROMISE.search(sentence) and _CLAIM_CONTEXT.search(sentence))
+
+
+def strip_preference_claims(text: str) -> tuple[str, int]:
+    """(the reply without preference-saving claims, how many sentences were removed). The text is returned
+    unchanged when there are none; line breaks (numbered steps) are kept and a line that was only a claim goes."""
+    if not isinstance(text, str) or not text:
+        return text, 0
+    removed, lines = 0, []
+    for line in text.split("\n"):
+        kept = []
+        for sentence in _CLAIM_SPLIT.split(line):
+            if sentence.strip() and is_preference_claim(sentence):
+                removed += 1
+            else:
+                kept.append(sentence)
+        new = " ".join(kept).rstrip()
+        if line.strip() and not new.strip():
+            continue
+        lines.append(new)
+    if not removed:
+        return text, 0
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip(), removed
+
+
+# Asking for an answer style at all, lasting or not: a request word plus a supported value. main.py uses it only to
+# say honestly that such a request was NOT saved; it never saves anything itself.
+_STYLE_REQUEST = re.compile(
+    r"(?i)\b(i\s+(?:really\s+)?(?:want|prefer|like|need|would\s+like)|i['’]d\s+(?:like|prefer)|give\s+me|"
+    r"can\s+you|could\s+you|please|make|keep|use|answer|reply|respond|write)\b")
+
+
+def asks_for_presentation(message: str) -> bool:
+    """True if the message asks for an answer length, format or language (whether or not it can be saved)."""
+    if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_CHARS:
+        return False
+    text = _QUOTED.sub(" ", message)
+    return bool(_STYLE_REQUEST.search(text)) and any(_values_in(s) for s in _SENTENCES.split(text) if s.strip())

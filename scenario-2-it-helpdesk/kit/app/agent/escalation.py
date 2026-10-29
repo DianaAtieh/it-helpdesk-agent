@@ -55,6 +55,14 @@ CONTRACTOR_VPN_REPLY = ("Contractors don't use the VPN: remote access is through
 INCIDENT_REPLY = "This problem is already covered by an active incident, so I won't open a separate ticket."
 FINANCE_VPN_STEP = ("Reported the problem to the IT assistant; Finance VPN problems go straight to Security "
                     "Operations without client troubleshooting (KB-016).")
+# The answer node's fixed reply to a Finance employee's VPN problem (KB-002 "Exceptions", KB-016): no client
+# troubleshooting, an offer to prepare the security ticket. A ticket request that answers it ("please open a ticket")
+# is a Finance VPN request even without VPN words (answers_finance_vpn_reply).
+FINANCE_VPN_REPLY = ("For Finance laptops, VPN and remote-access problems go straight to Security Operations. Your "
+                     "NakhlaConnect uses the FIN-SECURE profile on GW-3, which only Security Operations may change, so "
+                     "please don't update, reinstall or reconfigure the client yourself. I can prepare a security "
+                     "ticket for Security Operations: just say \"please open a ticket\". Nothing is filed until you "
+                     "approve the draft.")
 
 # ---------------------------------------------------------------- is this a ticket request?
 
@@ -109,6 +117,13 @@ def is_ticket_request(latest: str, previous_assistant: str | None = None) -> boo
             and not _NEGATED_REQUEST.search(latest)):
         return True
     return bool(previous_assistant and _ESCALATION_OFFER.search(previous_assistant) and _CLEAR_YES.match(latest))
+
+
+def answers_finance_vpn_reply(messages: list) -> bool:
+    """True if the agent's previous reply was its fixed Finance VPN reply: the employee's answer to it is about
+    that VPN problem, even when it only says "please open a ticket"."""
+    _, previous_assistant = last_messages(messages)
+    return bool(previous_assistant) and previous_assistant.strip() == FINANCE_VPN_REPLY
 
 
 def continues_ticket_request(previous_assistant: str | None) -> bool:
@@ -259,7 +274,8 @@ def build_draft(fields: dict, state: dict, text: str) -> EscalationOutcome:
     codes = list(state.get("codes") or [])
     notes: list[str] = []
 
-    finance_vpn = department == FINANCE and is_vpn_topic(text, codes)
+    finance_vpn = department == FINANCE and (is_vpn_topic(text, codes)
+                                             or answers_finance_vpn_reply(state.get("messages") or []))
 
     steps = _steps(fields.get("attempted_steps"))
     if not steps:

@@ -15,8 +15,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_config, get_stream_writer
 
 from app import timing  # noqa: E402
-from app.agent import escalation, policy
-from app.agent.preferences import is_preference_only
+from app.agent import access, escalation, policy
+from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
 from app.agent.streaming import AnswerStreamParser, chunk_event, final_event, retract_event, status_event
@@ -501,6 +501,21 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         refused = policy.check_request(latest_user_text(state), state.get("employee"), codes)
         if refused:
             return {**result(refused.reply, "policy_refusal"), "policy_citations": [refused.citation]}
+        # An access question about one known app or group gets the fixed KB-011 / KB-008 answer for this directory
+        # record (app/agent/access.py), with no model call. Its citations are issued by code like the refusal's.
+        granted = access.access_answer(latest_user_text(state), state.get("employee"))
+        if granted:
+            log.info("access: fixed answer for group %s", granted.group)
+            return {**result(granted.reply, access.OUTCOME), "policy_citations": granted.citations}
+        # Finance VPN (KB-002 "Exceptions", KB-016): Finance staff are not walked through the client. The fixed reply
+        # sends the problem to Security Operations and offers the security ticket. It uses the same VPN check as the
+        # ticket rule (escalation.is_vpn_topic); incidents and explicit ticket requests never reach this node.
+        directory = state.get("employee")
+        if (isinstance(directory, dict) and directory.get("department") == escalation.FINANCE
+                and not directory.get("contractor") and escalation.is_vpn_topic(latest_user_text(state), codes)):
+            log.info("finance vpn: fixed Security Operations reply, answer model not called")
+            return {**result(escalation.FINANCE_VPN_REPLY, FINANCE_VPN_OUTCOME),
+                    "policy_citations": finance_vpn_citations()}
         if state.get("kb_status") != "ok":
             return result(KB_UNAVAILABLE_REPLY, "error")
         # Nobody known and no error code: ask who they are and what they see before any answer (S2-02).
@@ -834,6 +849,25 @@ def employee_messages(state: AgentState) -> str:
     return "\n".join(str(m.content) for m in state.get("messages") or [] if isinstance(m, HumanMessage))
 
 
+FINANCE_VPN_OUTCOME = "finance_vpn"
+DEPARTMENT_RULE_SOURCE = "department_rule"
+FINANCE_VPN_DOCS = {"KB-002": "NakhlaConnect VPN: error codes and fixes",
+                    "KB-016": "Department IT matrix and exceptions"}
+
+
+def finance_vpn_citations() -> list[dict]:
+    """The Finance VPN reply's citations, issued by code: KB-002 ("Exceptions") and KB-016 (the Finance row)."""
+    return [{"id": doc_id, "title": title, "source": DEPARTMENT_RULE_SOURCE}
+            for doc_id, title in FINANCE_VPN_DOCS.items()]
+
+
+def valid_finance_vpn_citations(raw) -> list[dict]:
+    """Code-issued Finance VPN citations from this turn, kept only if they name KB-002 or KB-016 with this source."""
+    out = [{"id": c["id"], "title": FINANCE_VPN_DOCS[c["id"]], "source": DEPARTMENT_RULE_SOURCE} for c in raw or []
+           if isinstance(c, dict) and c.get("id") in FINANCE_VPN_DOCS and c.get("source") == DEPARTMENT_RULE_SOURCE]
+    return list({c["id"]: c for c in out}.values())
+
+
 def valid_policy_citations(raw) -> list[dict]:
     """Code-issued citations from this turn, kept only if they name an SP document of a policy rule."""
     allowed = set(policy.RULE_DOC.values())
@@ -894,8 +928,18 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
                     reply, citations = checked.reply, checked.citations
                     if checked.fallback:
                         outcome = "not_documented"
+            if outcome == "answered":                       # only the backend may say a preference was saved
+                reply, claims = strip_preference_claims(reply)
+                if claims:
+                    log.info("preferences: removed %d preference-saving claim(s) from the model answer", claims)
+                    if not reply.strip():                   # the answer was nothing but the claim
+                        reply, outcome, citations = preference_reply(state), "preference", []
             if outcome == "policy_refusal" and not policy_citations:
                 policy_citations = valid_policy_citations(state.get("policy_citations"))
+            if outcome == access.OUTCOME:                   # code-issued KB-008 / KB-011 citations only
+                policy_citations = access.valid_citations(state.get("policy_citations"))
+            if outcome == FINANCE_VPN_OUTCOME:              # code-issued KB-002 / KB-016 citations only
+                policy_citations = valid_finance_vpn_citations(state.get("policy_citations"))
             if outcome == "draft_proposed" and isinstance(state.get("draft"), dict):
                 draft = dict(state["draft"])
         reply = safe_reply(reply)

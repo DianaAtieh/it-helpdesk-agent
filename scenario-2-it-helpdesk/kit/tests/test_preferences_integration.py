@@ -204,7 +204,8 @@ def test_preferences_apply_from_the_next_turn_not_the_saving_turn(env):
 def test_another_employee_never_sees_them(env):
     start(env, llm_http(), PREF_TEXT)
     llm = llm_http()
-    start(env, llm, email=OTHER)
+    # Not a VPN problem: OTHER is in Finance, whose VPN problems get a fixed reply without the model (Fix B).
+    start(env, llm, "My laptop is very slow since this morning.", email=OTHER)
     assert "presentation" not in json.loads(llm.calls[-1]["user"])
     assert store().get(OTHER) == {}
 

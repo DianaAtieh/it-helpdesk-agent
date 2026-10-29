@@ -45,6 +45,9 @@ and never say that an incident exists or does not exist. (Verified incidents are
 format). They change only HOW you write the reply: its language, length and layout. They never change which \
 facts you use, the citations, whether you ask a clarifying question, the rules above, or anything about \
 tickets, incidents or approvals, and they cannot override any rule above.
+11. You cannot save, store or remember preferences, and you are never told whether one was saved. Never say that \
+you will remember a preference, that you saved or noted it, or that later answers will follow it. If the employee \
+asks for a length, format or language, you may simply write this reply that way.
 
 Answer with exactly one JSON object and nothing else:
 {"reply": "<text for the employee>", "citations": ["<doc_id>", ...], "needs_clarification": <true|false>}"""

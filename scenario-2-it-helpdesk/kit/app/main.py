@@ -39,8 +39,9 @@ load_dotenv(KIT / ".env", override=False)
 from app import timing  # noqa: E402
 from app.agent.graph import FINAL_NODE, build_graph  # noqa: E402  (after load_dotenv on purpose)
 from app.agent.nodes import STREAM_ANSWER_KEY, describe_status  # noqa: E402,F401  (describe_status: re-exported)
-from app.agent.preferences import (PreferenceStore, describe_preferences, extract_preferences,  # noqa: E402
-                                   safe_presentation)
+from app.agent.preferences import (SAVED_CONFIRMATION, PreferenceError, PreferenceStore,  # noqa: E402
+                                   asks_for_presentation, describe_preferences, extract_preferences,
+                                   normalize_email, safe_presentation)
 from app.agent.retrieval import KnowledgeBaseError, load_knowledge_base  # noqa: E402
 from app.agent.storage import delete_expired_threads, prune_thread, retention_days, trim_history  # noqa: E402
 from app.agent.streaming import (CHUNK, RETRACT, STATUS, STATUS_LABELS, reconcile, retract_event,  # noqa: E402
@@ -577,6 +578,13 @@ async def _chat(req: ChatRequest, session: dict, response: Response, emit=None,
 
 PREFERENCES_SAVE_FAILED_NOTE = ("I couldn't save your preference right now, so it was not saved. You can ask me again "
                                 "later.")
+# The other honest outcomes of a style request (see _save_preferences). None of them says anything was stored.
+PREFERENCES_NOT_LASTING_NOTE = ("I didn't save this as a lasting preference. To save one, say for example: "
+                                "\"I prefer short answers.\"")
+PREFERENCES_NO_EMAIL_NOTE = ("I can only save preferences for a known employee, so nothing was saved. Enter your work "
+                             "email and ask again.")
+PREFERENCES_INVALID_EMAIL_NOTE = "Your work email doesn't look valid, so nothing was saved. Check it and ask again."
+PREFERENCES_UNAVAILABLE_NOTE = "Saving preferences isn't available right now, so nothing was saved."
 PENDING_DRAFT_NOTE = "Your ticket draft is still waiting for your approval. Use Approve or Reject on the draft."
 # Turns that must never save a preference: the request failed, or was refused or blocked by a policy.
 _NO_SAVE_OUTCOMES = {"error", "blocked", "policy_refusal", "busy", "identity_mismatch"}
@@ -597,21 +605,41 @@ async def _load_preferences(email: str | None) -> dict[str, str]:
 async def _save_preferences(raw_message: str, email: str | None, outcome: str | None,
                             alive: Callable[[], bool] | None) -> str:
     """Save the explicit persistent preferences in the employee's ORIGINAL message and return the note to add to
-    the reply ("" if nothing was saved). Never raises. The original text is used, not the redacted one: a message
-    that contained a secret saves nothing. Only fixed whitelist values are stored, never the message."""
-    store = getattr(app.state, "preferences", None)
-    if store is None or not email or outcome in _NO_SAVE_OUTCOMES or (alive is not None and not alive()):
+    the reply. Never raises. The original text is used, not the redacted one: a message that contained a secret
+    saves nothing. Only fixed whitelist values are stored, never the message.
+
+    This note is the backend's word on what happened to a style request; the model's own claims are removed by the
+    respond node. The confirmation (SAVED_CONFIRMATION) appears only after the database write succeeded:
+      ""                            blocked / failed / interrupted turn, or no style was asked for
+      PREFERENCES_NO_EMAIL_NOTE     no linked email ("" on the preference route, whose fixed reply already says it)
+      PREFERENCES_INVALID_EMAIL_NOTE  the linked email is not an email address the store accepts
+      PREFERENCES_NOT_LASTING_NOTE  a style was asked for, but not as a lasting, supported preference
+      PREFERENCES_UNAVAILABLE_NOTE  the preferences store could not be opened at startup
+      PREFERENCES_SAVE_FAILED_NOTE  the database write failed
+    """
+    if outcome in _NO_SAVE_OUTCOMES or (alive is not None and not alive()):
         return ""
     wanted = extract_preferences(raw_message)
-    if not wanted:
+    if not wanted and not asks_for_presentation(raw_message):
         return ""
+    if not email:
+        return "" if outcome == "preference" else PREFERENCES_NO_EMAIL_NOTE
+    try:
+        normalize_email(email)
+    except PreferenceError:
+        return PREFERENCES_INVALID_EMAIL_NOTE
+    if not wanted:
+        return PREFERENCES_NOT_LASTING_NOTE
+    store = getattr(app.state, "preferences", None)
+    if store is None:
+        return PREFERENCES_UNAVAILABLE_NOTE
     try:
         saved = await asyncio.to_thread(store.set_many, email, wanted)
     except Exception:
         log.exception("preferences: could not save them")
         return PREFERENCES_SAVE_FAILED_NOTE
     log.info("preferences: saved %s", ",".join(sorted(saved)))
-    return (f"Saved to your preferences: {describe_preferences(saved)}. This only changes how I write answers, "
+    return (f"{SAVED_CONFIRMATION} {describe_preferences(saved)}. This only changes how I write answers, "
             "and you can clear it at any time.")
 
 
