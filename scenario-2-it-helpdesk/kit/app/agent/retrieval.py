@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Protocol
 
+from app import timing
 from ingestion.build_index import DEFAULT_DB
 from ingestion.embeddings import DEFAULT_BASE_URL, EmbeddingError, OpenRouterEmbeddings, RetryPolicy
 from ingestion.error_codes import codes_in_text
@@ -160,7 +161,18 @@ def live_embeddings(model: str | None) -> OpenRouterEmbeddings:
     from openai import OpenAI
     client = OpenAI(api_key=api_key, base_url=os.getenv("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
                     max_retries=0, timeout=LIVE_EMBED_TIMEOUT_S)     # retries live in RetryPolicy only
-    return OpenRouterEmbeddings.from_env(model, retry=RetryPolicy(max_attempts=LIVE_EMBED_ATTEMPTS), client=client)
+    provider = OpenRouterEmbeddings.from_env(model, retry=RetryPolicy(max_attempts=LIVE_EMBED_ATTEMPTS), client=client)
+    embed = provider.embed
+
+    def timed_embed(texts):
+        timing.mark("embed_start")           # names and milliseconds only: never the text or the vector
+        try:
+            return embed(texts)
+        finally:
+            timing.mark("embed_end")
+
+    provider.embed = timed_embed
+    return provider
 
 
 def load_knowledge_base(db_path: Path | str = DEFAULT_INDEX) -> PolicyKnowledgeBase:

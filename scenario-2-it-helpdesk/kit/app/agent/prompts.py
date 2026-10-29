@@ -43,6 +43,16 @@ and never say that an incident exists or does not exist. (Verified incidents are
 Answer with exactly one JSON object and nothing else:
 {"reply": "<text for the employee>", "citations": ["<doc_id>", ...], "needs_clarification": <true|false>}"""
 
+# The streaming answer uses the same rules, with a plain-text envelope instead of JSON (a JSON string cannot be
+# shown safely while it is still being written). The envelope is converted back to the same three fields by
+# app/agent/streaming.py, and everything after that is unchanged.
+STREAM_FORMAT = """Answer in plain text, NOT JSON, in exactly this layout:
+Line 1: MODE: ANSWER   or   MODE: CLARIFY   ("MODE: CLARIFY" is "needs_clarification": true in the rules above)
+Then the text for the employee (for MODE: CLARIFY: only the one short question).
+Last line, only for MODE: ANSWER: CITATIONS: <doc_id>, <doc_id>   (the "citations" of the rules above)"""
+
+STREAM_SYSTEM_PROMPT = SYSTEM_PROMPT.split("Answer with exactly one JSON object", 1)[0] + STREAM_FORMAT
+
 
 def history_for_prompt(messages: list, limit: int = MAX_HISTORY_FOR_PROMPT) -> list[dict]:
     """The conversation before the latest message, newest last, as plain {role, text} records."""

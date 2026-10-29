@@ -1,7 +1,8 @@
 """Gradio UI starter for the IT Helpdesk Agent - a small client of YOUR API contract.
 
 It never talks to the helpdesk API or the LLM directly. It only calls your app:
-    POST {APP_URL}/api/chat      {"session_id", "message", "user": {"email"}}
+    POST {APP_URL}/api/chat      fallback only, when the WebSocket is unavailable
+    WS   {APP_URL}/ws/chat       one chat turn per connection; answer text streams in while the model generates it
     POST {APP_URL}/api/approve   {"session_id", "action_id", "approved"}  + header X-Session-Token
 The app sends a session token (X-Session-Token response header) on the first chat turn of a conversation;
 approving or rejecting needs it back. It is kept in this tab's server-side state, next to the session id it
@@ -11,13 +12,23 @@ Replace it with your own UI if you like; keep the contract.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import logging
 import os
+import time
 import uuid
 
 import gradio as gr
 import httpx
+import websockets.asyncio.client
+import websockets.exceptions
 
-APP_URL = os.getenv("APP_URL", "http://localhost:8000").rstrip("/")
+ui_log = logging.getLogger("helpdesk-ui.timing")
+APP_URL = os.getenv("APP_URL", "http://127.0.0.1:8000").rstrip("/")   # 127.0.0.1: "localhost" costs ~2 s on Windows (::1 first)
+WS_OPEN_SECONDS = float(os.getenv("UI_WS_OPEN_SECONDS") or 10)
+WS_IDLE_SECONDS = float(os.getenv("UI_WS_IDLE_SECONDS") or 120)   # longest silence while the app works on a turn
 NO_CARD = "_No ticket draft waiting for approval._"
 
 # ---------------------------------------------------------------- palm theme
@@ -98,6 +109,117 @@ def call_app(path: str, body: dict, token: str | None = None) -> tuple[dict, str
     return (data if isinstance(data, dict) else {"reply": str(data)}), r.headers.get("X-Session-Token")
 
 
+class WSUnavailable(Exception):
+    """The WebSocket could not be opened, or died before our message was sent: nothing happened server-side,
+    so the turn may be retried over POST /api/chat."""
+
+
+def ws_url() -> str:
+    base = APP_URL
+    return ("wss" if base.startswith("https://") else "ws") + "://" + base.split("://", 1)[-1] + "/ws/chat"
+
+
+class UITiming:
+    """Client-side timing of one streamed turn, relative to the moment the UI started it (monotonic clock).
+
+    Joined to the server's `timing` log lines by turn_id (the two processes' clocks are not comparable, so only
+    the turn_id and the elapsed values are). Logs names and numbers only: no message, answer or token.
+    "displayed" means Gradio asked for the next update after receiving the previous one (the generator was
+    resumed); it does not include the browser's own rendering time."""
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter()
+        self.marks: dict[str, float] = {}
+        self.turn_id: str | None = None
+        self.chunks = 0
+        self.max_gap_ms = 0.0
+        self._last_chunk: float | None = None
+
+    def mark(self, name: str) -> None:
+        self.marks.setdefault(name, round((time.perf_counter() - self.started) * 1000, 1))
+
+    def chunk_received(self) -> None:
+        now = time.perf_counter()
+        self.chunks += 1
+        self.mark("first_chunk_received")
+        if self._last_chunk is not None:
+            self.max_gap_ms = max(self.max_gap_ms, round((now - self._last_chunk) * 1000, 1))
+        self._last_chunk = now
+
+    def log(self) -> None:
+        fields = " ".join(f"{k}_ms={v}" for k, v in self.marks.items())
+        ui_log.info("ui_timing turn=%s chunks=%s max_chunk_gap_ms=%s %s", self.turn_id, self.chunks,
+                    self.max_gap_ms, fields)
+
+
+async def ws_turn(body: dict, token: str | None, timing: UITiming | None = None):
+    """One chat turn over /ws/chat. An async generator of UI events:
+        ("chunk", text)             provisional text, in order
+        ("retract", reason)         drop everything shown so far
+        ("final", data, token)      the authoritative answer (the ChatResponse fields); token only on a first turn
+        ("error", message)          a safe message from the app, or ours
+    Raises WSUnavailable only while nothing has been sent. The token goes in a handshake header, never the URL.
+    """
+    import websockets
+    headers = {"X-Session-Token": token} if token else {}
+    timing = timing or UITiming()
+    try:
+        timing.mark("connect_start")
+        ws = await websockets.asyncio.client.connect(ws_url(), additional_headers=headers, proxy=None,
+                                                     open_timeout=WS_OPEN_SECONDS, max_size=2 ** 20)
+        timing.mark("connected")
+        try:
+            await ws.send(json.dumps({"type": "chat", **body}))
+            timing.mark("request_sent")
+        except Exception:
+            await ws.close()
+            raise
+    except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as exc:
+        raise WSUnavailable(exc.__class__.__name__) from None
+    turn_id, last_seq, done = None, 0, False
+    try:
+        while not done:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), WS_IDLE_SECONDS)
+                event = json.loads(raw)
+                if not isinstance(event, dict) or not isinstance(event.get("seq"), int):
+                    raise ValueError("bad event")
+            except asyncio.TimeoutError:
+                yield "error", "The assistant took too long to answer. Please try again."
+                return
+            except websockets.exceptions.ConnectionClosed:
+                yield "error", "The connection to the assistant was lost before the answer was complete."
+                return
+            except (ValueError, TypeError):
+                yield "error", "The assistant sent an unreadable answer. Please try again."
+                return
+            if turn_id is None:
+                turn_id = event.get("turn_id")
+                timing.turn_id = turn_id if isinstance(turn_id, str) else None
+                timing.mark("first_event_received")
+            if event.get("turn_id") != turn_id or event["seq"] <= last_seq:
+                continue                                  # another turn's or a replayed / out-of-order event
+            last_seq = event["seq"]
+            kind = event.get("type")
+            if kind == "chunk" and isinstance(event.get("text"), str):
+                timing.chunk_received()
+                yield "chunk", event["text"]
+            elif kind == "retract":
+                yield "retract", str(event.get("reason") or "")
+            elif kind == "final":
+                done = True
+                timing.mark("final_received")
+                issued = event.get("session_token")
+                data = {k: v for k, v in event.items() if k not in ("type", "seq", "turn_id", "provisional",
+                                                                    "display", "session_token")}
+                yield "final", data, issued if isinstance(issued, str) else None
+            elif kind == "error":
+                done = True
+                yield "error", str(event.get("message") or "Something went wrong.")[:500]
+    finally:
+        await ws.close()                                  # also on UI cancellation (GeneratorExit)
+
+
 def side_panels(data: dict) -> tuple[str, str, str]:
     cites = data.get("citations") or []
     cite_md = "### Sources\n" + ("\n".join(
@@ -143,6 +265,7 @@ def show(data: dict, history: list):
 
 
 def send(message: str, history: list, session_id: str, email: str, auth: dict | None):
+    """Sync fallback path (POST /api/chat), kept for the case where the WebSocket is unavailable."""
     if not message.strip():
         return ("", history, *[gr.skip()] * 7, gr.skip())
     body = {"session_id": session_id, "message": message}
@@ -153,6 +276,53 @@ def send(message: str, history: list, session_id: str, email: str, auth: dict | 
     if issued:                                         # only the first turn of a conversation issues one
         auth = {"session_id": session_id, "token": issued}
     return ("", *show(data, history), auth)
+
+
+STREAMING_CURSOR = " ▌"                  # marks provisional text: it is replaced by the verified reply
+FALLBACK_NOTE = "_(Live streaming is unavailable, so this answer was not streamed.)_\n\n"
+
+
+async def send_stream(message: str, history: list, session_id: str, email: str, auth: dict | None):
+    """The chat handler: shows the answer while the model is still generating it (WebSocket /ws/chat)."""
+    if not message.strip():
+        yield ("", history, *[gr.skip()] * 7, gr.skip())
+        return
+    body = {"session_id": session_id, "message": message}
+    if email.strip():
+        body["user"] = {"email": email.strip().lower()}
+    base = history + [{"role": "user", "content": message}]
+    token = auth["token"] if auth and auth.get("session_id") == session_id else None
+    skip = [gr.skip()] * 7
+    shown = ""
+    timing = UITiming()
+    yield "", base, *skip, gr.skip()
+    try:
+        async with contextlib.aclosing(ws_turn(body, token, timing)) as turn:
+            async for event in turn:
+                kind = event[0]
+                if kind == "chunk":
+                    shown += event[1]
+                    yield gr.skip(), base + [{"role": "assistant", "content": shown + STREAMING_CURSOR}], *skip, gr.skip()
+                    timing.mark("first_chunk_displayed")
+                elif kind == "retract":
+                    shown = ""
+                    yield gr.skip(), base, *skip, gr.skip()
+                elif kind == "final":
+                    _, data, issued = event
+                    if issued:
+                        auth = {"session_id": session_id, "token": issued}
+                    yield gr.skip(), *show(data, base), auth
+                    timing.mark("final_displayed")
+                else:                   # an error: say so, keep the pending draft and the side panels as they are
+                    yield gr.skip(), base + [{"role": "assistant", "content": event[1]}], *skip, gr.skip()
+    except WSUnavailable:
+        data, issued = await asyncio.to_thread(call_app, "/api/chat", body, None)
+        if issued:
+            auth = {"session_id": session_id, "token": issued}
+        data = {**data, "reply": FALLBACK_NOTE + str(data.get("reply") or "")}
+        yield gr.skip(), *show(data, base), auth
+    finally:
+        timing.log()
 
 
 def decide(approved: bool, history: list, session_id: str, pending: dict | None, auth: dict | None):
@@ -187,9 +357,10 @@ with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
             cites = gr.Markdown("### Sources\n_No answer yet._", padding=True, elem_classes="palm-panel")
             tools = gr.Markdown("### Tool calls (last turn)\n_none_", padding=True, elem_classes="palm-panel")
     outputs = [chat, pending_state, card, approve_btn, reject_btn, cites, tools, result]
-    msg.submit(send, [msg, chat, session, email, auth_state], [msg, *outputs, auth_state])
+    msg.submit(send_stream, [msg, chat, session, email, auth_state], [msg, *outputs, auth_state])
     approve_btn.click(lambda h, s, p, a: decide(True, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
     reject_btn.click(lambda h, s, p, a: decide(False, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     demo.launch(server_port=int(os.getenv("UI_PORT", "7860")), theme=THEME, css=CSS)
