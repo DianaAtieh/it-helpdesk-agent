@@ -88,8 +88,9 @@ def body(session_id, text=TEXT, email=SARA, token=None) -> dict:
     return out
 
 
-def converse(client, payload=None, *, raw=None, headers=None) -> list[dict]:
-    """One connection, one turn: send the frame, read events until final / error / close."""
+def converse(client, payload=None, *, raw=None, headers=None, status=False) -> list[dict]:
+    """One connection, one turn: send the frame, read events until final / error / close. `status` progress
+    events are left out unless status=True: most tests are about chunk / retract / final / error."""
     events = []
     with client.websocket_connect("/ws/chat", headers=headers or {}) as ws:
         ws.send_text(raw if raw is not None else json.dumps(payload))
@@ -98,10 +99,19 @@ def converse(client, payload=None, *, raw=None, headers=None) -> list[dict]:
                 event = ws.receive_json()
             except WebSocketDisconnect:
                 break
-            events.append(event)
+            if status or event["type"] != "status":
+                events.append(event)
             if event["type"] in ("final", "error"):
                 break
     return events
+
+
+def next_event(ws) -> dict:
+    """The next non-status event from an open connection."""
+    while True:
+        event = ws.receive_json()
+        if event["type"] != "status":
+            return event
 
 
 def kinds(events):
@@ -120,7 +130,8 @@ def final_of(events):
 def first_turn(env, llm, session_id=None, **kw):
     client = env.use(llm, kw.pop("kb", None))
     session_id = session_id or sid()
-    events = converse(client, body(session_id, **kw))
+    status = kw.pop("status", False)
+    events = converse(client, body(session_id, **kw), status=status)
     return client, session_id, events
 
 
@@ -128,12 +139,16 @@ def first_turn(env, llm, session_id=None, **kw):
 
 def test_chunks_final_and_numbering_for_a_new_conversation(env):
     llm = FakeStreamChat(GOOD)
-    _, session_id, events = first_turn(env, llm)
+    _, session_id, events = first_turn(env, llm, status=True)
     final = final_of(events)
-    assert kinds(events) == ["chunk"] * (len(events) - 1) + ["final"] and len(events) >= 3
+    stages = [e["stage"] for e in events if e["type"] == "status"]
+    body_events = [e for e in events if e["type"] != "status"]
+    assert kinds(body_events) == ["chunk"] * (len(body_events) - 1) + ["final"] and len(body_events) >= 3
+    assert stages == ["employee", "knowledge_base", "preparing", "generating"]
+    assert kinds(events) == ["status"] * 4 + ["chunk"] * (len(body_events) - 1) + ["final"]   # status is first
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     assert len({e["turn_id"] for e in events}) == 1
-    assert all(e["provisional"] is True for e in events[:-1]) and final["provisional"] is False
+    assert all(e["provisional"] is True for e in body_events[:-1]) and final["provisional"] is False
     assert chunk_text(events).strip() == GOOD_REPLY == final["reply"] and final["display"] == "keep"
     assert final["state"] == "answered" and final["session_id"] == session_id
     assert final["citations"] == [{"id": "KB-002", "title": "VPN client versions", "url": None}]
@@ -158,13 +173,13 @@ def test_the_first_chunk_arrives_while_the_model_is_still_generating(env):
     client = env.use(llm)
     with client.websocket_connect("/ws/chat") as ws:
         ws.send_text(json.dumps(body(sid())))
-        first = ws.receive_json()
+        first = next_event(ws)
         assert first["type"] == "chunk" and first["text"].startswith("Update NakhlaConnect")
         assert not release.is_set()
         release.set()
         rest = []
         while not rest or rest[-1]["type"] != "final":
-            rest.append(ws.receive_json())
+            rest.append(next_event(ws))
     assert seen["waited_for_client"] and rest[-1]["reply"] == GOOD_REPLY and rest[-1]["display"] == "keep"
 
 
@@ -180,7 +195,7 @@ def test_retract_when_a_chunk_check_trips_then_the_policy_final(env):
                           "Done.\n", "CITATIONS: KB-002"])
     _, _, events = first_turn(env, llm)
     assert kinds(events) == ["chunk", "retract", "final"]
-    assert [e["seq"] for e in events] == [1, 2, 3] and "posture" not in chunk_text(events)
+    assert [e["seq"] for e in events] == sorted(e["seq"] for e in events) and "posture" not in chunk_text(events)
     final = final_of(events)
     assert final["state"] == "policy_refusal" and final["display"] == "replace" and "skip the posture" not in final["reply"]
 
@@ -395,7 +410,7 @@ def test_disconnect_mid_stream_finishes_and_saves_the_turn_and_frees_the_lock(en
     token = final_of(events)["session_token"]
     with client.websocket_connect("/ws/chat") as ws:
         ws.send_text(json.dumps(body(session_id, token=token)))
-        assert ws.receive_json()["type"] == "chunk"
+        assert next_event(ws)["type"] == "chunk"
     wait_until_idle(session_id)
     # Starlette's TestClient cancels the handler on close (uvicorn would not), so this is the harsher case:
     # the lock is freed and the conversation stays usable.

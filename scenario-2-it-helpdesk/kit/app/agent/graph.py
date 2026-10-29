@@ -24,10 +24,11 @@ from langgraph.graph import END, START, StateGraph
 
 from app import timing
 from app.agent.evidence_eval import make_evaluate
-from app.agent.nodes import (MCPClient, make_answer, make_escalate, make_respond, make_retrieve, make_triage,
-                             route_after_retrieve, route_after_triage)
+from app.agent.nodes import (MCPClient, emit_status, make_answer, make_escalate, make_respond, make_retrieve,
+                             make_triage, route_after_retrieve, route_after_triage)
 from app.agent.retrieval import KnowledgeBase
 from app.agent.state import AgentState
+from app.agent.streaming import NODE_STATUS
 from app.llm import ChatModel
 
 # The node that ends every turn. Updates made outside a run (the approval gate saving its state,
@@ -42,6 +43,8 @@ def timed(name: str, node):
     @functools.wraps(node)
     async def run(*args, **kwargs):
         timing.mark(f"{name}_start")
+        if name in NODE_STATUS:
+            emit_status(NODE_STATUS[name])       # before the node's own work (its tool calls, the embedding request)
         try:
             return await node(*args, **kwargs)
         finally:
@@ -62,7 +65,7 @@ def build_graph(checkpointer: BaseCheckpointSaver, mcp: MCPClient, kb: Knowledge
     graph.add_node("escalate", timed("escalate", make_escalate(llm, mcp)))
     graph.add_node(FINAL_NODE, timed("respond", make_respond()))
     graph.add_edge(START, "triage")
-    graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "retrieve": "retrieve"})
+    graph.add_conditional_edges("triage", route_after_triage, {"incident": FINAL_NODE, "status": FINAL_NODE, "preference": FINAL_NODE, "retrieve": "retrieve"})
     if evaluate_evidence:
         graph.add_node("evaluate", timed("evaluate", make_evaluate(kb, llm)))
         graph.add_conditional_edges("retrieve", route_after_retrieve, {"escalate": "escalate", "answer": "evaluate"})

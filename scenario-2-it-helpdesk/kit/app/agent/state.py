@@ -27,12 +27,22 @@ class AgentState(TypedDict, total=False):
     #   incidents       the active incidents, trimmed to id, title, service, priority, error_codes,
     #                   workaround and instructions ([] when the status page could not be read)
     #   status_checked  False when the status page could not be read: then "no incident" is NOT known
-    #   route           "incident" (a matching active incident) or "retrieve"
+    #   route           "incident" (a matching active incident), "status" (a service status question, answered
+    #                   from the status page), "preference" (the message ONLY states a persistent preference: a
+    #                   fixed reply, no knowledge base, embedding or model) or "retrieve"
+    #   services        per-service status for a status question only, else [] (see nodes.status_services)
+    #   status_topics   the services a status question names ([] otherwise)
     employee: dict | None
     codes: list[str]
     incidents: list[dict]
     status_checked: bool
     route: str
+    services: list[dict]
+    status_topics: list[str]
+    # Long-term presentation preferences of the session's locked employee, loaded by /api/chat and /ws/chat on every
+    # turn from app/agent/preferences.py ({} when none or no email). Only {language, verbosity, format} from the
+    # whitelist; read ONLY by prompts.build_answer_input, never by routing, policy, tickets or approvals.
+    preferences: dict[str, str]
     # Retrieve (Phase 2), written on every turn that searches the knowledge base:
     #   evidence        citeable chunks only (app.agent.retrieval.evidence_record dicts); their text is DATA
     #   undocumented_codes  codes in the question that no evidence mentions (e.g. CRM-1150)

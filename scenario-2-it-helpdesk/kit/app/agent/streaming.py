@@ -33,7 +33,24 @@ _TRAILER_WORD = "CITATIONS:"
 _DOC_ID = re.compile(r"\b[A-Za-z]{2,6}-\d{1,5}\b")
 _BOUNDARY = re.compile(r"[.!?]\s+|\n")
 
-CHUNK, RETRACT, FINAL = "chunk", "retract", "final"
+CHUNK, RETRACT, FINAL, STATUS = "chunk", "retract", "final", "status"
+
+# Progress of the run, one per graph stage that actually starts. The labels are fixed generic text: nothing from
+# the conversation, the directory, the tools or the evidence ever goes into a status event.
+STATUS_LABELS = {
+    "employee": "Checking employee information",
+    "knowledge_base": "Searching the knowledge base",
+    "evaluating": "Reviewing the retrieved information",
+    "preparing": "Preparing the answer",
+    "generating": "Generating the response",
+    "ticket": "Preparing your ticket request",
+}
+NODE_STATUS = {"triage": "employee", "retrieve": "knowledge_base", "evaluate": "evaluating", "answer": "preparing",
+               "escalate": "ticket"}      # graph node -> the stage announced when it starts
+
+
+def status_event(stage: str) -> dict:
+    return {"type": STATUS, "stage": stage, "label": STATUS_LABELS[stage]}
 
 
 def chunk_event(seq: int, text: str) -> dict:

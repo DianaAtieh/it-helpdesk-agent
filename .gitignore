@@ -16,7 +16,12 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.sqlite
-*.sqlite3
+
+# Long-term preferences (app/agent/preferences.py). Its own SQLite file; SQLite writes -wal and -shm files too.
+scenario-2-it-helpdesk/kit/app/data/preferences.db
+scenario-2-it-helpdesk/kit/app/data/preferences.db-wal
+scenario-2-it-helpdesk/kit/app/data/preferences.db-shm
+scenario-2-it-helpdesk/kit/app/data/preferences.db-journal
 
 # Local generated data
 memory_store/

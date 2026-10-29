@@ -22,6 +22,7 @@ _current: contextvars.ContextVar["TurnTimer | None"] = contextvars.ContextVar("t
 
 # (summary key, from mark, to mark): the phases that explain where the latency of a streamed answer goes.
 PHASES = (
+    ("request_to_first_status_ms", "ws_request_received", "ws_first_status_sent"),   # first visible progress
     ("ws_accept_ms", "ws_accept_start", "ws_accepted"),                   # server side of the WebSocket handshake
     ("accept_to_request_ms", "ws_accepted", "ws_request_received"),       # client finishing its connect + sending the frame
     ("receive_to_triage_ms", "ws_request_received", "triage_start"),      # session lock, load, redaction, graph start

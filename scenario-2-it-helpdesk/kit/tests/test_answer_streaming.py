@@ -31,8 +31,9 @@ GOOD = ["MODE: ANSWER\n", "Update NakhlaConnect ", "to 5.4 from Software Center.
 GOOD_REPLY = "Update NakhlaConnect to 5.4 from Software Center. Then restart it."
 
 
-def run_turn(llm, kb=None, text=TEXT, streaming=True, evaluate=False, thread="t-1", mcp=None):
-    """Run one turn through the graph; return (custom events, final state)."""
+def run_turn(llm, kb=None, text=TEXT, streaming=True, evaluate=False, thread="t-1", mcp=None, with_status=False):
+    """Run one turn through the graph; return (custom events, final state). `status` progress events are left
+    out unless with_status: these tests are about chunk / retract / final."""
     graph = build_graph(InMemorySaver(), mcp or FakeMCP(), kb or FakeKnowledgeBase(kb_result(KB002)), llm,
                         evaluate_evidence=evaluate)
     configurable = {"thread_id": thread, **({STREAM_ANSWER_KEY: True} if streaming else {})}
@@ -42,7 +43,8 @@ def run_turn(llm, kb=None, text=TEXT, streaming=True, evaluate=False, thread="t-
         async for mode, payload in graph.astream({"messages": [HumanMessage(content=text)], "user_email": SARA},
                                                  {"configurable": configurable}, stream_mode=["custom", "values"]):
             if mode == "custom":
-                events.append(payload)
+                if with_status or payload.get("type") != "status":
+                    events.append(payload)
             else:
                 final = payload
         return events, final
@@ -374,6 +376,8 @@ def test_cancelled_turn_closes_the_model_stream():
             async for mode, payload in graph.astream(
                     {"messages": [HumanMessage(content=TEXT)], "user_email": SARA},
                     {"configurable": {"thread_id": "c-1", STREAM_ANSWER_KEY: True}}, stream_mode=["custom"]):
+                if payload["type"] != "chunk":
+                    continue
                 llm_started["first"] = payload
                 seen.set()
 

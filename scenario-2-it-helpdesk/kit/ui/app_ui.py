@@ -154,6 +154,7 @@ class UITiming:
 
 async def ws_turn(body: dict, token: str | None, timing: UITiming | None = None):
     """One chat turn over /ws/chat. An async generator of UI events:
+        ("status", label)           which stage the agent is in (transient; before the first chunk)
         ("chunk", text)             provisional text, in order
         ("retract", reason)         drop everything shown so far
         ("final", data, token)      the authoritative answer (the ChatResponse fields); token only on a first turn
@@ -201,7 +202,10 @@ async def ws_turn(body: dict, token: str | None, timing: UITiming | None = None)
                 continue                                  # another turn's or a replayed / out-of-order event
             last_seq = event["seq"]
             kind = event.get("type")
-            if kind == "chunk" and isinstance(event.get("text"), str):
+            if kind == "status" and isinstance(event.get("label"), str):
+                timing.mark("first_status_received")
+                yield "status", event["label"][:STATUS_MAX_CHARS]
+            elif kind == "chunk" and isinstance(event.get("text"), str):
                 timing.chunk_received()
                 yield "chunk", event["text"]
             elif kind == "retract":
@@ -272,13 +276,22 @@ def send(message: str, history: list, session_id: str, email: str, auth: dict | 
     if email.strip():
         body["user"] = {"email": email.strip().lower()}
     history = history + [{"role": "user", "content": message}]
-    data, issued = call_app("/api/chat", body)
+    token = auth["token"] if auth and auth.get("session_id") == session_id else None
+    data, issued = call_app("/api/chat", body, token)
     if issued:                                         # only the first turn of a conversation issues one
         auth = {"session_id": session_id, "token": issued}
     return ("", *show(data, history), auth)
 
 
 STREAMING_CURSOR = " ▌"                  # marks provisional text: it is replaced by the verified reply
+STATUS_MAX_CHARS = 80
+STATUS_PREFIX = "⏳ "                    # a status is a temporary bubble: never part of the history or the reply
+
+
+def status_bubble(label: str) -> dict:
+    return {"role": "assistant", "content": f"{STATUS_PREFIX}_{label}…_"}
+
+
 FALLBACK_NOTE = "_(Live streaming is unavailable, so this answer was not streamed.)_\n\n"
 
 
@@ -300,7 +313,11 @@ async def send_stream(message: str, history: list, session_id: str, email: str, 
         async with contextlib.aclosing(ws_turn(body, token, timing)) as turn:
             async for event in turn:
                 kind = event[0]
-                if kind == "chunk":
+                if kind == "status":
+                    if not shown:       # only while no answer text is on screen; `base` never contains a status
+                        yield gr.skip(), base + [status_bubble(event[1])], *skip, gr.skip()
+                        timing.mark("first_status_displayed")
+                elif kind == "chunk":
                     shown += event[1]
                     yield gr.skip(), base + [{"role": "assistant", "content": shown + STREAMING_CURSOR}], *skip, gr.skip()
                     timing.mark("first_chunk_displayed")
@@ -316,7 +333,7 @@ async def send_stream(message: str, history: list, session_id: str, email: str, 
                 else:                   # an error: say so, keep the pending draft and the side panels as they are
                     yield gr.skip(), base + [{"role": "assistant", "content": event[1]}], *skip, gr.skip()
     except WSUnavailable:
-        data, issued = await asyncio.to_thread(call_app, "/api/chat", body, None)
+        data, issued = await asyncio.to_thread(call_app, "/api/chat", body, token)
         if issued:
             auth = {"session_id": session_id, "token": issued}
         data = {**data, "reply": FALLBACK_NOTE + str(data.get("reply") or "")}
@@ -334,6 +351,73 @@ def decide(approved: bool, history: list, session_id: str, pending: dict | None,
     data, _ = call_app("/api/approve", {"session_id": session_id, "action_id": pending.get("action_id"),
                                         "approved": approved}, token)
     return show(data, history)
+
+
+# ---------------------------------------------------------------- saved preferences (long-term, per employee)
+# These call GET /preferences and POST /preferences/reset with THIS tab's session id and token (headers only).
+# They never touch the chat, the pending ticket draft or the session: "Clear chat" in Gradio only empties the
+# visible chat box, POST /reset is not used here, and clearing preferences does not do either.
+PREF_LABELS = (("language", "Language"), ("verbosity", "Answer length"), ("format", "Answer format"))
+PREF_VALUES = {"en": "English", "short": "short", "normal": "normal", "detailed": "detailed",
+               "numbered": "numbered steps", "bullets": "bullet points", "prose": "plain prose"}
+PREF_NOTE = ("_Preferences only change how answers are written, never facts, policies or tickets. "
+             "The email you type is not verified: this is a demo without login._")
+PREF_NO_SESSION = "Send a message first, so this conversation is linked to your email."
+PREF_ERRORS = {
+    401: "This conversation could not be verified. Send a message first.",
+    403: "This conversation's session is no longer valid. Start a new chat and try again.",
+    404: "This conversation is not linked to an email yet. Send a message with your email first.",
+    409: "The conversation is busy. Try again in a moment.",
+    503: "Preferences are not available right now.",
+}
+
+
+def render_preferences(preferences: dict | None) -> str:
+    rows = [f"- **{label}:** {PREF_VALUES.get(preferences[key], preferences[key])}"
+            for key, label in PREF_LABELS if preferences and key in preferences]
+    body = "\n".join(rows) if rows else "_No saved preferences._"
+    return f"### Saved Preferences\n{body}\n\n{PREF_NOTE}"
+
+
+def call_preferences(method: str, path: str, session_id: str, auth: dict | None) -> tuple[bool, dict | str]:
+    """(True, JSON) when the app confirmed with HTTP 200, else (False, a safe message). Without a token for THIS
+    session id nothing is sent. The token goes in a header only; nothing about the request or answer is logged."""
+    if not auth or auth.get("session_id") != session_id or not auth.get("token"):
+        return False, PREF_NO_SESSION
+    headers = {"X-Session-Id": session_id, "X-Session-Token": auth["token"]}
+    try:
+        r = httpx.request(method, f"{APP_URL}{path}", headers=headers, timeout=30)
+    except httpx.HTTPError as exc:
+        ui_log.warning("preferences request failed: %s", exc.__class__.__name__)
+        return False, f"Cannot reach the app at {APP_URL}. Is it running?"
+    if r.status_code != 200:
+        return False, PREF_ERRORS.get(r.status_code, f"The app answered HTTP {r.status_code}.")
+    try:
+        data = r.json()
+    except ValueError:
+        return False, "The app sent an answer that could not be read."
+    return (True, data) if isinstance(data, dict) else (False, "The app sent an answer that could not be read.")
+
+
+def refresh_preferences(session_id: str, auth: dict | None):
+    """-> (saved preferences panel, feedback). On failure the panel is left as it was."""
+    ok, data = call_preferences("GET", "/preferences", session_id, auth)
+    if not ok:
+        return gr.update(), f"⚠️ Could not load your preferences. {data}"
+    saved = data.get("preferences")
+    if not isinstance(saved, dict):
+        return gr.update(), "⚠️ Could not load your preferences. The app sent an answer that could not be read."
+    return render_preferences(saved), "Preferences refreshed."
+
+
+def clear_preferences(session_id: str, auth: dict | None):
+    """-> (saved preferences panel, feedback). Success is claimed only when the app confirms it."""
+    ok, data = call_preferences("POST", "/preferences/reset", session_id, auth)
+    if not ok:
+        return gr.update(), f"⚠️ Your preferences were NOT cleared. {data}"
+    if data.get("status") != "ok":
+        return gr.update(), "⚠️ Your preferences were NOT cleared. The app did not confirm it."
+    return render_preferences({}), "✅ Your saved preferences were cleared. Your chat and any ticket draft are unchanged."
 
 
 with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
@@ -354,12 +438,20 @@ with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
                     approve_btn = gr.Button("Approve", variant="primary", interactive=False)
                     reject_btn = gr.Button("Reject", variant="stop", interactive=False)
             result = gr.Markdown("", elem_classes="palm-panel")
+            with gr.Group(elem_classes="palm-card"):
+                prefs_panel = gr.Markdown(render_preferences({}), padding=True)
+                with gr.Row():
+                    prefs_refresh_btn = gr.Button("Refresh Preferences")
+                    prefs_clear_btn = gr.Button("Clear Saved Preferences", variant="stop")
+                prefs_feedback = gr.Markdown("")
             cites = gr.Markdown("### Sources\n_No answer yet._", padding=True, elem_classes="palm-panel")
             tools = gr.Markdown("### Tool calls (last turn)\n_none_", padding=True, elem_classes="palm-panel")
     outputs = [chat, pending_state, card, approve_btn, reject_btn, cites, tools, result]
     msg.submit(send_stream, [msg, chat, session, email, auth_state], [msg, *outputs, auth_state])
     approve_btn.click(lambda h, s, p, a: decide(True, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
     reject_btn.click(lambda h, s, p, a: decide(False, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
+    prefs_refresh_btn.click(refresh_preferences, [session, auth_state], [prefs_panel, prefs_feedback])
+    prefs_clear_btn.click(clear_preferences, [session, auth_state], [prefs_panel, prefs_feedback])
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

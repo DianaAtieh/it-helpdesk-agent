@@ -129,6 +129,60 @@ def test_chunks_reach_the_ui_before_the_server_has_finished(point_at):
     assert seen[0].startswith("Update NakhlaConnect") and seen[-1] == REPLY
 
 
+def status(label, seq, turn="t1", stage="knowledge_base"):
+    return {"type": "status", "turn_id": turn, "seq": seq, "stage": stage, "label": label}
+
+
+def assistant_texts(steps):
+    return [s[1][-1]["content"] for s in steps
+            if isinstance(s[1], list) and s[1] and s[1][-1]["role"] == "assistant"]
+
+
+def test_status_is_shown_then_replaced_by_the_first_chunk_and_never_persists(point_at):
+    async def go():
+        async with FakeServer([status("Checking employee information", 1), status("Searching the knowledge base", 2),
+                               chunk("Update NakhlaConnect to 5.4. ", 3), chunk("Then restart it.", 4),
+                               final(seq=5)]) as srv:
+            point_at(srv.port)
+            return await run()
+    texts = assistant_texts(asyncio.run(go()))
+    assert ui.STATUS_PREFIX in texts[0] and "Checking employee information" in texts[0]
+    assert "Searching the knowledge base" in texts[1]
+    assert texts[2] == "Update NakhlaConnect to 5.4. " + ui.STREAMING_CURSOR          # status gone at first chunk
+    assert all(ui.STATUS_PREFIX not in t for t in texts[2:])
+    assert texts[-1] == REPLY and ui.STATUS_PREFIX not in texts[-1]
+
+
+def test_a_status_arriving_after_a_chunk_is_ignored(point_at):
+    async def go():
+        async with FakeServer([chunk("Update NakhlaConnect to 5.4. ", 1), status("Searching the knowledge base", 2),
+                               final(seq=3)]) as srv:
+            point_at(srv.port)
+            return await run()
+    texts = assistant_texts(asyncio.run(go()))
+    assert all(ui.STATUS_PREFIX not in t for t in texts) and texts[-1] == REPLY
+
+
+def test_a_status_then_final_without_chunks_leaves_only_the_verified_reply(point_at):
+    async def go():
+        async with FakeServer([status("Preparing the answer", 1, stage="preparing"), final(seq=2)]) as srv:
+            point_at(srv.port)
+            return await run()
+    steps = asyncio.run(go())
+    texts = assistant_texts(steps)
+    assert ui.STATUS_PREFIX in texts[0] and texts[-1] == REPLY
+    assert [m["role"] for m in steps[-1][1]] == ["user", "assistant"]
+
+
+def test_malformed_or_oversized_status_labels_are_bounded_or_ignored(point_at):
+    async def go():
+        async with FakeServer([status(None, 1), status("x" * 500, 2), final(seq=3)]) as srv:
+            point_at(srv.port)
+            return await run()
+    texts = assistant_texts(asyncio.run(go()))
+    assert all(len(t) < 200 for t in texts) and texts[-1] == REPLY
+
+
 def test_retract_removes_the_provisional_text_and_final_replaces_it(point_at):
     retract = {"type": "retract", "turn_id": "t1", "seq": 2, "reason": "policy"}
 
@@ -265,6 +319,33 @@ def test_websocket_unavailable_falls_back_to_http_and_says_so(point_at, monkeypa
     assert calls == [("/api/chat", None)]
     assert steps[-1][1][-1]["content"].startswith(ui.FALLBACK_NOTE) and REPLY in steps[-1][1][-1]["content"]
     assert steps[-1][-1] == {"session_id": SID, "token": TOKEN}
+
+
+def test_the_http_fallback_sends_this_tabs_token_on_later_turns(point_at, monkeypatch):
+    calls = []
+
+    def fake_call(path, body, token=None):
+        calls.append((path, token))
+        return {"reply": REPLY, "state": "answered"}, None
+
+    monkeypatch.setattr(ui, "call_app", fake_call)
+    monkeypatch.setattr(ui, "APP_URL", "http://127.0.0.1:9")
+    asyncio.run(run(auth={"session_id": SID, "token": TOKEN}))
+    asyncio.run(run(auth={"session_id": "ui-" + "b" * 32, "token": TOKEN}))      # another tab's token is never sent
+    assert calls == [("/api/chat", TOKEN), ("/api/chat", None)]
+
+
+def test_the_sync_send_path_sends_this_tabs_token(monkeypatch):
+    calls = []
+
+    def fake_call(path, body, token=None):
+        calls.append((path, token))
+        return {"reply": REPLY, "state": "answered"}, None
+
+    monkeypatch.setattr(ui, "call_app", fake_call)
+    ui.send("hello", [], SID, "sara.mikhail@nakhla.example", {"session_id": SID, "token": TOKEN})
+    ui.send("hello", [], SID, "sara.mikhail@nakhla.example", None)
+    assert calls == [("/api/chat", TOKEN), ("/api/chat", None)]
 
 
 def test_an_unauthorized_websocket_is_not_retried_over_http(point_at, monkeypatch):
