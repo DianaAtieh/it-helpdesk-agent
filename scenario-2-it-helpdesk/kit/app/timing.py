@@ -26,6 +26,8 @@ PHASES = (
     ("accept_to_request_ms", "ws_accepted", "ws_request_received"),       # client finishing its connect + sending the frame
     ("receive_to_triage_ms", "ws_request_received", "triage_start"),      # session lock, load, redaction, graph start
     ("triage_ms", "triage_start", "triage_end"),                          # directory + status page (MCP)
+    ("triage_lookup_ms", "triage_lookup_start", "triage_lookup_end"),     # lookup_employee alone (first turn only)
+    ("triage_status_ms", "triage_status_start", "triage_status_end"),     # get_service_status alone
     ("retrieve_ms", "retrieve_start", "retrieve_end"),                    # knowledge base (embeddings + search)
     ("embed_ms", "embed_start", "embed_end"),                             # the query embedding request alone
     ("search_ms", "embed_end", "retrieve_end"),                           # local search + policy filtering after it

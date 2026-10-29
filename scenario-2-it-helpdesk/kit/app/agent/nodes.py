@@ -121,11 +121,15 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
         elif isinstance(cached, dict) and cached.get("email") == email:
             employee = cached
         else:
+            timing.mark("triage_lookup_start")
             data, call = await mcp.call("lookup_employee", {"email": email})
+            timing.mark("triage_lookup_end")
             calls.append(call.model_dump())
             employee = employee_record(data, email)
 
+        timing.mark("triage_status_start")
         data, call = await mcp.call("get_service_status")
+        timing.mark("triage_status_end")
         calls.append(call.model_dump())
         status_checked = bool(data.get("ok"))
         incidents = active_incidents(data) if status_checked else []

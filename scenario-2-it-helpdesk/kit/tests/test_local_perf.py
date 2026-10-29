@@ -18,6 +18,7 @@ import httpx
 from app import timing
 from app.agent import retrieval
 from services import helpdesk_mcp as server
+from tests.test_ws_chat import env  # noqa: F401  (fixture)
 
 KIT = Path(__file__).resolve().parent.parent
 
@@ -97,6 +98,28 @@ def test_api_url_defaults_to_ipv4_loopback_not_localhost():
     out = subprocess.run([sys.executable, "-c", "from services import helpdesk_mcp as s; print(s.API_URL)"], cwd=KIT,
                          env={**os.environ, "HELPDESK_API_URL": ""}, capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "http://127.0.0.1:8102", out.stderr[-300:]
+
+
+def test_the_lifespan_builds_the_client_at_start_up_so_the_first_call_does_not():
+    async def run():
+        assert server._client is None or server._client_loop is not asyncio.get_running_loop()
+        async with server._lifespan(server.mcp):
+            return server._client is not None and server._client_loop is asyncio.get_running_loop()
+
+    assert asyncio.run(run())
+
+
+def test_triage_marks_each_mcp_call_separately(env, caplog):
+    from tests.test_timing import first_turn, marks
+    caplog.set_level(logging.INFO, logger="helpdesk-app.timing")
+    from tests.fakes import FakeStreamChat
+    first_turn(env, FakeStreamChat(["MODE: ANSWER\n", "Update NakhlaConnect to 5.4 from Software Center.\n",
+                                    "CITATIONS: KB-002"]))
+    got = marks(caplog)
+    order = ["triage_start", "triage_lookup_start", "triage_lookup_end", "triage_status_start", "triage_status_end",
+             "triage_end"]
+    assert [m for m in order if m not in got] == []
+    assert [got[m] for m in order] == sorted(got[m] for m in order)
 
 
 # ------------------------------------------------------------------ the Gradio default

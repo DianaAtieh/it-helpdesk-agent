@@ -91,6 +91,7 @@ async def _close_client() -> None:
 
 @asynccontextmanager
 async def _lifespan(_server):
+    _shared_client()   # build it at start-up (~0.5 s: TLS trust store, pools), not inside the first employee's request
     try:
         yield
     finally:
