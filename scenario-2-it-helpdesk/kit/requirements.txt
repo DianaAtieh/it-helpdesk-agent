@@ -18,6 +18,8 @@ pymupdf==1.28.2
 
 # UI starter (ui/app_ui.py)
 gradio==6.30.0
+# WebSocket client for streaming chat (already installed as a gradio dependency; pinned because the UI imports it)
+websockets==17.3
 
 # Retrieval helpers: .env loading and vector math (a Module 6 style store)
 python-dotenv==1.2.4

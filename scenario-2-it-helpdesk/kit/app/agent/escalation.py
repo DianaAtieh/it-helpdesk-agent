@@ -62,7 +62,7 @@ FINANCE_VPN_STEP = ("Reported the problem to the IT assistant; Finance VPN probl
 # it". Detected in the employee's latest message only; the model never decides to escalate on its own.
 _TICKET_REQUEST = re.compile(
     r"(?i)\b(?:open|create|file|raise|log|submit|make|start|prepare|draft|put\s+in|get)\s+"
-    r"(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:support\s+|it\s+|helpdesk\s+|service\s+desk\s+)?"
+    r"(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:(?:new|support|it|helpdesk|service\s+desk)\s+){0,3}"
     r"(?:ticket|request)\b"
     r"|\bescalat(?:e|ed|ing|ion)\b"
     r"|\bneeds?\s+a\s+ticket\b"
@@ -72,6 +72,12 @@ _TICKET_REQUEST = re.compile(
 _NEGATED_REQUEST = re.compile(
     r"(?i)(?:\bdon't|\bdont|\bdo\s+not|\bno\s+need\s+to|\bnever)\s+(?:want\s+to\s+|need\s+to\s+|have\s+to\s+)?"
     r"(?:open|create|file|raise|log|submit|make|start|prepare|draft|escalat\w*)\b")
+# A question ABOUT the process ("How do I create a ticket?", "where can I open a ticket") is not a request to
+# make one. Only the words before the request verb, in the same sentence, count: "How do I fix this? Please open
+# a ticket" is still a request, and "Can you create a ticket for me?" is an action request.
+_INFORMATIONAL = re.compile(
+    r"(?i)\b(?:how\s+(?:do|does|can|could|should|would|to)|where\s+(?:do|does|can|could|should)"
+    r"|what(?:'s|\s+is)\s+the\s+(?:process|procedure|way))\b[^.?!]*$")
 # The agent's previous reply offered escalation ("I can escalate it to IT as a ticket", "Would you like me to
 # prepare a ticket?"), and the employee's answer is a clear, short yes.
 _ESCALATION_OFFER = re.compile(
@@ -99,7 +105,8 @@ def last_messages(messages: list) -> tuple[str, str | None]:
 def is_ticket_request(latest: str, previous_assistant: str | None = None) -> bool:
     """True only for an explicit ticket request, or a clear yes to the agent's own offer to escalate."""
     latest = latest or ""
-    if _TICKET_REQUEST.search(latest) and not _NEGATED_REQUEST.search(latest):
+    if (any(not _INFORMATIONAL.search(latest[:m.start()]) for m in _TICKET_REQUEST.finditer(latest))
+            and not _NEGATED_REQUEST.search(latest)):
         return True
     return bool(previous_assistant and _ESCALATION_OFFER.search(previous_assistant) and _CLEAR_YES.match(latest))
 

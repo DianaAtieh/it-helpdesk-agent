@@ -33,6 +33,19 @@ def checkpoint_db(tmp_path_factory):
         os.environ["CHECKPOINT_DB"] = previous
 
 
+@pytest.fixture(scope="session", autouse=True)
+def preferences_db(tmp_path_factory):
+    """A throw-away preferences database, so no test ever creates or writes app/data/preferences.db."""
+    path = tmp_path_factory.mktemp("preferences") / "preferences.db"
+    previous = os.environ.get("PREFERENCES_DB")
+    os.environ["PREFERENCES_DB"] = str(path)
+    yield path
+    if previous is None:
+        os.environ.pop("PREFERENCES_DB", None)
+    else:
+        os.environ["PREFERENCES_DB"] = previous
+
+
 @pytest.fixture(scope="session")
 def client(checkpoint_db):
     with TestClient(app) as c:          # starts the app's lifespan once: checkpointer + MCP server

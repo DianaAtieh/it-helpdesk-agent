@@ -5,15 +5,21 @@ can pass fakes. The flow (app/agent/graph.py): triage -> (incident | retrieve ->
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from contextlib import aclosing
 from typing import Any, Awaitable, Callable, Protocol
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.config import get_config, get_stream_writer
 
+from app import timing  # noqa: E402
 from app.agent import escalation, policy
-from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
+from app.agent.preferences import is_preference_only
+from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
+from app.agent.streaming import AnswerStreamParser, chunk_event, final_event, retract_event, status_event
 from app.agent.retrieval import KnowledgeBase, KnowledgeBaseError, strict_codes
 from app.agent.state import AgentState
 from app.agent.verifier import verify_answer
@@ -81,10 +87,131 @@ def employee_record(data: dict, email: str) -> dict | None:
 
 def active_incidents(data: dict) -> list[dict]:
     """The status page's ACTIVE incidents, trimmed to the fields the agent uses (resolved ones are dropped)."""
-    incidents = (data.get("status") or {}).get("incidents") or []
+    page = data.get("status")
+    incidents = page.get("incidents") if isinstance(page, dict) else None
+    if not isinstance(incidents, list):
+        return []
     return [{key: incident.get(key) for key in INCIDENT_FIELDS}
             | {"error_codes": [str(code).upper() for code in incident.get("error_codes") or []]}
             for incident in incidents if isinstance(incident, dict) and incident.get("status") == "active"]
+
+
+# ---------------------------------------------------------------- service status questions (no LLM)
+
+# What the employee may name -> the words that identify that service in the status page's id + name. The
+# status page decides which services exist; nothing here names an incident, a gateway or a state.
+STATUS_TOPICS: dict[str, tuple[re.Pattern, tuple[str, ...]]] = {
+    "vpn": (re.compile(r"(?i)\b(vpn|nakhlaconnect)\b"), ("vpn", "nakhlaconnect")),
+    "mail": (re.compile(r"(?i)\b(e-?mail|mail|outlook)\b"), ("mail",)),
+    "wifi": (re.compile(r"(?i)\b(wi-?fi|wireless)\b"), ("wifi", "wi-fi")),
+    "print": (re.compile(r"(?i)\b(print|printing|printers?|nakhlaprint)\b"), ("print",)),
+    "signin": (re.compile(r"(?i)\b(sign-?\s?in|log-?\s?in|sso|nakhlaid|nakhlakey)\b"), ("nakhlaid", "sign-in", "sso")),
+    "software": (re.compile(r"(?i)\bsoftware center\b"), ("software",)),
+    "vdi": (re.compile(r"(?i)\b(vdi|virtual desktop|nakhla workspace)\b"), ("vdi", "workspace")),
+}
+_STATUS_CUES = (
+    # "Is the VPN down / experiencing an outage / degraded / affected ...?"
+    re.compile(r"(?i)^\W*(is|are|was|were|has|have|does|do)\b.*\b(down|outage|degraded|disrupt\w*|incidents?|"
+               r"experiencing|affected|reported)\b"),
+    re.compile(r"(?i)\boutage\b.*\b(is|are|any|there|current\w*|reported|ongoing|general)\b|"
+               r"\b(is|are|any|there|current\w*|reported|ongoing|general)\b.*\boutage\b"),
+    re.compile(r"(?i)\b(current\w*|latest|live)\b.*\bstatus\b|\bservice status\b|\bstatus of\b"),
+    re.compile(r"(?i)\bdown for (everyone|everybody|all|the company|anyone)\b|\bnot working for everyone\b"),
+)
+# Troubleshooting questions mention "down" too; they belong to the knowledge base, not to the status page.
+_NOT_A_STATUS_QUESTION = re.compile(r"(?i)\b(how|why|fix|fixing|troubleshoot\w*|steps?|resolve|repair|solve|"
+                                    r"reset|restart|configure|install|set ?up)\b")
+_SENTENCES = re.compile(r"(?<=[.!?])\s+|\n+")
+MAX_STATUS_SERVICES, MAX_STATUS_COMPONENTS, MAX_STATUS_TEXT = 12, 6, 240
+_KNOWN_STATES = {"operational": "operational", "degraded": "degraded", "outage": "down", "major_outage": "down",
+                 "partial_outage": "degraded", "down": "down"}
+
+
+def status_question(text: str, messages: list | None = None) -> list[str]:
+    """The service topics of an explicit "is X down / is there an outage / what is the status" question, or [].
+
+    Pure code on the latest message. It stays out of the way of every other intent: a question about fixing or
+    how-to, a message with an error code, and a ticket request all return []."""
+    text = text or ""
+    if not text.strip() or _NOT_A_STATUS_QUESTION.search(text) or strict_codes(text):
+        return []
+    if messages is not None and escalation.wants_ticket(messages):
+        return []
+    topics: list[str] = []
+    for sentence in _SENTENCES.split(text):
+        if not any(cue.search(sentence) for cue in _STATUS_CUES):
+            continue
+        topics += [key for key, (pattern, _) in STATUS_TOPICS.items() if pattern.search(sentence)]
+    return list(dict.fromkeys(topics))
+
+
+def _clean(value: Any, limit: int = MAX_STATUS_TEXT) -> str:
+    """A status-page string as inert, bounded text (it is data, never an instruction)."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value if value is not None else ""))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def status_services(data: dict) -> list[dict]:
+    """The per-service status from a get_service_status result, trimmed and bounded. State values are
+    normalised to operational | degraded | down | unknown; only non-operational components are kept."""
+    page = data.get("status")
+    services = page.get("services") if isinstance(page, dict) else None
+    if not isinstance(services, list):
+        return []
+    out = []
+    for service in services[:MAX_STATUS_SERVICES]:
+        if not isinstance(service, dict) or not service.get("id"):
+            continue
+        components = []
+        for component in service.get("components") if isinstance(service.get("components"), list) else []:
+            if not isinstance(component, dict):
+                continue
+            state = _KNOWN_STATES.get(str(component.get("status")).lower(), "unknown")
+            if state != "operational" and len(components) < MAX_STATUS_COMPONENTS:
+                components.append({"name": _clean(component.get("name") or component.get("id"), 80), "status": state})
+        out.append({"id": _clean(service["id"], 40).lower(), "name": _clean(service.get("name"), 80),
+                    "status": _KNOWN_STATES.get(str(service.get("status")).lower(), "unknown"),
+                    "components": components})
+    return out
+
+
+def _services_for(topics: list[str], services: list[dict]) -> list[dict]:
+    needles = {n for topic in topics for n in STATUS_TOPICS.get(topic, (None, ()))[1]}
+    return [s for s in services if any(n in f"{s['id']} {s['name']}".lower() for n in needles)]
+
+
+def service_status_reply(state: AgentState) -> str:
+    """The reply to a status question, from the status page only (no model). It never says "operational"
+    without that status from the page, and never invents an incident."""
+    cannot = ("I can't verify the current status of that service right now, so I can't say whether it is up or "
+              "down. Please try again in a moment or check the IT status page.")
+    if not state.get("status_checked"):
+        return cannot
+    matched = _services_for(state.get("status_topics") or [], state.get("services") or [])
+    if not matched:
+        return cannot
+    incidents = [i for i in state.get("incidents") or [] if isinstance(i, dict)]
+    lines = []
+    for service in matched:
+        name = service["name"] or service["id"]
+        if service["status"] == "operational":
+            line = f"{name}: the status page currently reports it as operational."
+        elif service["status"] in ("degraded", "down"):
+            line = (f"{name} is currently reported as degraded, not a complete outage." if service["status"] == "degraded"
+                    else f"{name} is currently reported as down.")
+            if service["components"]:
+                line += " Affected: " + "; ".join(f"{c['name']} ({c['status']})" for c in service["components"]) + "."
+        else:
+            line = f"I can't verify the status of {name}: the status page gave no recognised state for it."
+        lines.append(line)
+        for incident in [i for i in incidents if _clean(i.get("service"), 40).lower() == service["id"]][:2]:
+            detail = f"Active incident {_clean(incident.get('id'), 40)}: {_clean(incident.get('title')) or 'service problem'}."
+            if incident.get("workaround"):
+                detail += f" Workaround: {_clean(incident['workaround'])}"
+            if incident.get("instructions"):
+                detail += f" {_clean(incident['instructions'])}"
+            lines.append(detail)
+    return "\n".join(lines)
 
 
 def match_incident(incidents: list[dict], text: str, codes: list[str]) -> dict | None:
@@ -116,24 +243,37 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
         elif isinstance(cached, dict) and cached.get("email") == email:
             employee = cached
         else:
+            timing.mark("triage_lookup_start")
             data, call = await mcp.call("lookup_employee", {"email": email})
+            timing.mark("triage_lookup_end")
             calls.append(call.model_dump())
             employee = employee_record(data, email)
 
+        timing.mark("triage_status_start")
         data, call = await mcp.call("get_service_status")
+        timing.mark("triage_status_end")
         calls.append(call.model_dump())
-        status_checked = bool(data.get("ok"))
+        status_checked = bool(data.get("ok")) and isinstance(data.get("status"), dict)
         incidents = active_incidents(data) if status_checked else []
 
         codes = list(strict_codes(text))
         matched = match_incident(incidents, text, codes)
+        topics = [] if matched else status_question(text, state.get("messages") or [])
+        # A message that is ONLY a persistent preference request ("From now on, use numbered steps.") is not an IT
+        # problem: it skips the knowledge base, the embedding and the model. Every other route, a policy refusal and
+        # a ticket request take precedence, and a mixed message is never preference-only (see is_preference_only).
+        preference_only = (not matched and not topics and not codes and is_preference_only(text)
+                           and not escalation.wants_ticket(state.get("messages") or [])
+                           and not policy.check_request(text, employee, codes))
         return {
             "employee": employee,
             "codes": codes,
             "incidents": incidents,
             "status_checked": status_checked,
             "active_incident": matched,
-            "route": "incident" if matched else "retrieve",
+            "services": status_services(data) if status_checked and topics else [],
+            "status_topics": topics,
+            "route": "incident" if matched else "status" if topics else "preference" if preference_only else "retrieve",
             "tool_calls": calls,
         }
 
@@ -141,8 +281,20 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
 
 
 def route_after_triage(state: AgentState) -> str:
-    """The conditional edge after triage (wired in a later step): "incident" or "retrieve"."""
-    return "incident" if state.get("route") == "incident" else "retrieve"
+    """The conditional edge after triage: "incident", "status" (a service status question), "preference" (a message
+    that only states a persistent preference) or "retrieve"."""
+    return state.get("route") if state.get("route") in ("incident", "status", "preference") else "retrieve"
+
+
+# What the employee sees before the backend's own "Saved to your preferences: ..." (or "could not save") note.
+# It claims nothing about saving: the save happens after the turn, and only the backend can report its result.
+PREFERENCE_REPLY = "Thanks for letting me know how you like my answers written. Is there an IT problem I can help with?"
+PREFERENCE_NO_EMAIL_REPLY = ("I can only keep preferences for a known employee. Please tell me your work email, "
+                             "then ask again. Is there an IT problem I can help with?")
+
+
+def preference_reply(state: AgentState) -> str:
+    return PREFERENCE_REPLY if (state.get("user_email") or "").strip() else PREFERENCE_NO_EMAIL_REPLY
 
 
 # ---------------------------------------------------------------- retrieve (Phase 2): no LLM
@@ -339,7 +491,7 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
     def result(reply: str, outcome: str, citations: list[dict] | None = None, usage: dict | None = None) -> dict:
         return {"reply": reply, "outcome": outcome, "citations": citations or [], "usage": usage or {}}
 
-    async def answer(state: AgentState) -> dict:
+    async def answer(state: AgentState, config=None) -> dict:      # `config` is injected by LangGraph by name
         evidence = list(state.get("evidence") or [])
         codes = list(state.get("codes") or [])
         undocumented = list(state.get("undocumented_codes") or [])
@@ -376,17 +528,32 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         if llm is None:
             return result(LLM_FAILED_REPLY, "error")
 
+        # Streaming is opt-in per run (config["configurable"]["stream_answer"]) and needs a model that can
+        # stream. Everything above ran first, so a gated turn never streams. Everything below the model call
+        # is the same for both paths.
+        writer = stream_writer(config) if hasattr(llm, "stream_text") else None
+        shown = False
         try:
-            out = await llm.complete_json(SYSTEM_PROMPT, build_answer_input(state, latest_user_text(state)))
+            if writer:
+                data, usage, shown = await stream_generate(llm, state, writer)
+            else:
+                out = await llm.complete_json(SYSTEM_PROMPT, build_answer_input(state, latest_user_text(state)))
+                data, usage = out.data, out.usage
         except LLMError:
             return result(LLM_FAILED_REPLY, "error", usage=state.get("evaluation_usage"))
-        used = add_usage(state.get("evaluation_usage"), out.usage)
-        reply = out.data.get("reply")
+        used = add_usage(state.get("evaluation_usage"), usage)
+        concluded = conclude(state, data, evidence, used)
+        if shown and concluded["outcome"] != "answered":    # what was streamed is not what is being answered
+            writer(retract_event("not_answered"))
+        return concluded
+
+    def conclude(state: AgentState, data: dict, evidence: list[dict], used: dict) -> dict:
+        reply = data.get("reply")
         if not isinstance(reply, str) or not reply.strip():
             return result(LLM_FAILED_REPLY, "error", usage=used)
         reply = reply.strip()[:MAX_REPLY_CHARS]
-        citations = cited(out.data, evidence)
-        if out.data.get("needs_clarification") is True:
+        citations = cited(data, evidence)
+        if data.get("needs_clarification") is True:
             # A question needs no citation, so it must really be only a question; otherwise ask our own.
             question = reply if is_safe_clarification(reply) else clarify_reply(state)
             return result(question, "clarify", [], used)
@@ -395,6 +562,96 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         return result(reply, "answered", citations, used)
 
     return answer
+
+
+# ---------------------------------------------------------------- buffered live streaming of the answer
+
+STREAM_ANSWER_KEY = "stream_answer"     # config["configurable"][STREAM_ANSWER_KEY] = True asks for streaming
+STREAM_TOTAL_SECONDS = 60.0             # one streamed answer may not take longer than this
+
+
+def stream_writer(config: dict | None):
+    """The custom-stream writer if this run asked for streaming, else None (then nothing is ever emitted)."""
+    if not ((config or {}).get("configurable") or {}).get(STREAM_ANSWER_KEY):
+        return None
+    try:
+        return get_stream_writer()
+    except RuntimeError:                # not running inside a graph
+        return None
+
+
+def emit_status(stage: str) -> None:
+    """Tell a streaming client which stage just started (a `status` event on the same custom stream as the answer
+    chunks). Does nothing unless this run asked for streaming, so HTTP and non-streaming runs are unchanged."""
+    try:
+        writer = stream_writer(get_config())
+    except RuntimeError:                # not running inside a graph
+        return
+    if writer:
+        writer(status_event(stage))
+
+
+def stream_violation(text: str) -> str | None:
+    """The chunk check (risk reduction only; respond stays authoritative): why text must not be shown, or None.
+    Uses the same rules as respond: forbidden advice, secrets, ticket IDs and false ticket claims."""
+    if policy.find_forbidden_advice(text):
+        return "policy"
+    if redact_secrets(text) != text:
+        return "secret"
+    if _TICKET_ID.search(text):
+        return "ticket_id"
+    for line in text.split("\n"):
+        if any(is_false_claim(sentence) for sentence in _SENTENCE_END.split(line)):
+            return "ticket_claim"
+    return None
+
+
+async def stream_generate(llm: Any, state: AgentState, writer: Callable[[dict], None]) -> tuple[dict, dict, bool]:
+    """Run the answer model as a stream. Returns (data, usage, shown): data has the usual reply / citations /
+    needs_clarification; shown is True if chunks are on the client's screen at the end (not retracted).
+
+    Only this function emits chunks, only for the answer model, only after the chunk check passed. A failed
+    check or a failure after chunks were shown emits one retract. If the model ignores the plain-text envelope
+    before anything was shown, the answer is asked once more in the normal JSON way."""
+    parser = AnswerStreamParser(stream_violation)
+    user = build_answer_input(state, latest_user_text(state))
+    usage: dict = {}
+    seq = 0
+    retracted = False
+    writer(status_event("generating"))
+
+    def emit(chunks: list[str]) -> None:
+        nonlocal seq, retracted
+        for text in chunks:
+            seq += 1
+            timing.mark("first_chunk_emitted")
+            writer(chunk_event(seq, text))
+        if parser.tripped and parser.released_any and not retracted:
+            retracted = True
+            log.info("stream: chunk check %s tripped, retract sent", parser.tripped)
+            writer(retract_event(parser.tripped))
+
+    try:
+        async with asyncio.timeout(STREAM_TOTAL_SECONDS):
+            timing.mark("llm_request_started")
+            async with aclosing(llm.stream_text(STREAM_SYSTEM_PROMPT, user, usage=usage)) as deltas:
+                async for delta in deltas:
+                    timing.mark("llm_first_token")
+                    emit(parser.feed(delta))
+            timing.mark("llm_stream_end")
+            chunks, parsed = parser.finish()
+            emit(chunks)
+    except (LLMError, TimeoutError) as exc:
+        if parser.released_any and not retracted:
+            writer(retract_event("error"))
+        if isinstance(exc, TimeoutError):
+            raise LLMError("timeout", "the streamed answer took too long") from None
+        raise
+    if parsed is None:
+        log.info("stream: the model ignored the envelope; asking once without streaming")
+        out = await llm.complete_json(SYSTEM_PROMPT, user)
+        return out.data, add_usage(usage, out.usage), False
+    return parsed, usage, parser.released_any and not retracted
 
 
 def evaluation_hold(state: AgentState) -> dict | None:
@@ -600,12 +857,16 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         other turn it is cleared, so an old draft can never be picked up later.
     """
 
-    async def respond(state: AgentState) -> dict:
+    async def respond(state: AgentState, config=None) -> dict:
         incident = state.get("active_incident")
         draft = None
         policy_citations: list[dict] = []
         if state.get("route") == "incident" and isinstance(incident, dict) and incident.get("id"):
             reply, outcome, citations, usage = incident_reply(incident), "incident", [], {}
+        elif state.get("route") == "status":
+            reply, outcome, citations, usage = service_status_reply(state), "service_status", [], {}
+        elif state.get("route") == "preference":
+            reply, outcome, citations, usage = preference_reply(state), "preference", [], {}
         else:
             titles: dict[str, str] = {}
             for record in state.get("evidence") or []:
@@ -641,6 +902,9 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         # The response shows model/evidence citations and, on a refusal, the code-issued SP citation; the state
         # keeps the code-issued ones apart (policy_citations), so they are never mistaken for the model's.
         shown = citations + [{"id": c["id"], "title": c["title"]} for c in policy_citations]
+        writer = stream_writer(config)
+        if writer:                  # the authoritative end of a streamed turn: replaces any provisional chunks
+            writer(final_event(reply, shown, outcome))
         return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
                 "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft}
 

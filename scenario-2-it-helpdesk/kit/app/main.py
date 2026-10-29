@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -21,29 +22,34 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
+from typing import Callable
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-
+from starlette.websockets import WebSocketState
 KIT = Path(__file__).resolve().parent.parent
 
 # The kit's .env, without overriding variables that are already set (e.g. by Docker).
 load_dotenv(KIT / ".env", override=False)
 
+from app import timing  # noqa: E402
 from app.agent.graph import FINAL_NODE, build_graph  # noqa: E402  (after load_dotenv on purpose)
-from app.agent.nodes import describe_status  # noqa: E402,F401  (re-exported: it used to live here)
+from app.agent.nodes import STREAM_ANSWER_KEY, describe_status  # noqa: E402,F401  (describe_status: re-exported)
+from app.agent.preferences import (PreferenceStore, describe_preferences, extract_preferences,  # noqa: E402
+                                   safe_presentation)
 from app.agent.retrieval import KnowledgeBaseError, load_knowledge_base  # noqa: E402
 from app.agent.storage import delete_expired_threads, prune_thread, retention_days, trim_history  # noqa: E402
+from app.agent.streaming import (CHUNK, RETRACT, STATUS, STATUS_LABELS, reconcile, retract_event,  # noqa: E402
+                                 status_event)
 from app.guardrails import WITHHELD, looks_like_instructions, redact_secrets  # noqa: E402
 from app.llm import LLMError, OpenRouterChat  # noqa: E402
 from app.mcp_client import HelpdeskMCP  # noqa: E402
 from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, Citation, PendingAction,  # noqa: E402
-                         ResetRequest, ToolCall)
+                         ResetRequest, SessionId, ToolCall)
 from app.tickets import ROUTING, TICKET_ID, TicketDraft, TicketDraftError, propose_ticket  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -89,6 +95,13 @@ async def lifespan(app: FastAPI):
     except LLMError as exc:
         log.warning("chat model unavailable (%s): chat answers will say so", exc.code)
         app.state.llm = None
+    # Long-term preferences: their own SQLite file, never the checkpoint database, so a session reset or the
+    # checkpoint clean-up cannot touch them. If it cannot be opened the app still starts, without preferences.
+    try:
+        app.state.preferences = PreferenceStore()
+    except Exception:
+        log.exception("preferences database unavailable: preferences will not be loaded or saved")
+        app.state.preferences = None
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -104,6 +117,7 @@ async def lifespan(app: FastAPI):
             await mcp.stop()
             app.state.graph = None
             app.state.checkpointer = None
+            app.state.preferences = None
 
 
 app = FastAPI(title="Nakhla IT Helpdesk Agent", version="0.1.0", lifespan=lifespan)
@@ -373,10 +387,25 @@ def health() -> dict:
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, response: Response) -> ChatResponse:
+async def chat(req: ChatRequest, request: Request, response: Response) -> ChatResponse:
     session = get_session(req.session_id)
     try:
         async with session_turn(session):
+            # Same rule as /ws/chat: a conversation that already exists must present its own session token (header
+            # or cookie). Only a brand-new conversation is claimed by its first turn, which is issued the token.
+            # A refused request reads nothing, writes nothing and saves no preference. The typed email is not proof.
+            try:
+                await load_session(req.session_id, session)
+            except Exception:
+                log.exception("chat session=%s: could not load the saved conversation", session_ref(req.session_id))
+                return agent_error_reply(req.session_id)
+            if session["stored"] or session["token_hash"]:
+                problem = token_problem(session, presented_token(request, req.session_id))
+                if problem:
+                    log.warning("chat session=%s refused: %s session token", session_ref(req.session_id), problem)
+                    body = ChatResponse(session_id=req.session_id, reply=UNAUTHORIZED_REPLY[problem],
+                                        state="unauthorized")
+                    return JSONResponse(status_code=403, content=body.model_dump())
             return await _chat(req, session, response)
     except SessionBusy:
         log.info("chat session=%s busy: an earlier request is still running", session_ref(req.session_id))
@@ -396,7 +425,34 @@ def agent_error_reply(session_id: str) -> ChatResponse:
     )
 
 
-async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResponse:
+async def run_graph(graph, turn: dict, config: dict, emit=None) -> dict:
+    """Run one turn of the agent and return its final state, the same state graph.ainvoke returns.
+
+    emit=None is the plain HTTP path (ainvoke, exactly as before). With emit (the WebSocket), streaming is
+    switched on for this run only and the answer node's provisional `chunk` / `retract` events, and the graph's
+    `status` (progress) events, are handed to
+    `emit` while the model is still generating. The graph's own `final` event is dropped: the authoritative
+    final is built by the caller after every post-graph check.
+    """
+    if emit is None:
+        return await graph.ainvoke(turn, config)
+    streaming = {**config, "configurable": {**config["configurable"], STREAM_ANSWER_KEY: True}}
+    state = None
+    timing.mark("graph_start")
+    async for mode, payload in graph.astream(turn, streaming, stream_mode=["custom", "values"]):
+        if mode == "custom":
+            if isinstance(payload, dict) and payload.get("type") in (CHUNK, RETRACT, STATUS):
+                await emit(payload)
+        else:
+            state = payload
+    timing.mark("graph_end")
+    if state is None:
+        raise RuntimeError("the graph produced no state")
+    return state
+
+
+async def _chat(req: ChatRequest, session: dict, response: Response, emit=None,
+                alive: Callable[[], bool] | None = None) -> ChatResponse:
     graph = app.state.graph
     config = thread_config(req.session_id)
 
@@ -449,13 +505,16 @@ async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResp
     turn: dict = {"messages": [human]}
     if email:
         turn["user_email"] = email
+    # Presentation preferences of the LOCKED email, read fresh every turn (an empty dict clears any older copy in
+    # the checkpoint). A stored value never reaches the graph unless it is on the whitelist.
+    turn["preferences"] = await _load_preferences(email)
     # A new conversation gets its token in this turn: saved with the turn, sent only if the turn succeeds.
     new_token, token_fields = None, {}
     if not session["token_hash"] and not session["stored"]:
         new_token, token_fields = new_session_token()
         turn.update(token_fields)
     try:
-        out = await graph.ainvoke(turn, config)
+        out = await run_graph(graph, turn, config, emit)
         # A ticket draft proposed this turn (Phase 4) becomes a pending action only through propose_draft, which
         # checks it against the directory and the ticket schema. Nothing is filed here: only /api/approve files.
         pending_action, draft_calls = None, []
@@ -492,15 +551,68 @@ async def _chat(req: ChatRequest, session: dict, response: Response) -> ChatResp
     # The graph's outcome maps onto the contract's existing fields: state (answered | clarify | incident |
     # not_documented | blocked | error, or await_approval with a pending_action when a draft was stored),
     # citations (only documents in this turn's evidence, checked by respond) and usage.
+    # An explicit "remember that I prefer ..." is saved only now: the turn succeeded, the request is for the locked
+    # email, and (WebSocket) the client is still connected. The note says only what was really saved.
+    note = await _save_preferences(req.message, email, out.get("outcome"), alive)
+    reply = f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"]
+    if note:
+        reply = f"{reply}\n\n{note}"
+    # A preference-only turn does not touch the ticket workflow: a draft that is waiting stays pending (only
+    # Approve / Reject change it) and is shown again, so a client that redraws from this answer does not lose it.
+    waiting = session["pending_action"] if out.get("outcome") == "preference" and not pending_action else None
+    if waiting:
+        reply = f"{reply}\n\n{PENDING_DRAFT_NOTE}"
+        pending_action = waiting
     return ChatResponse(
         session_id=req.session_id,
-        reply=f"{CLAIM_NOTE} {out['reply']}" if claimed else out["reply"],
-        state="await_approval" if pending_action else (out.get("outcome") or "error"),
+        reply=reply,
+        state=(out.get("outcome") or "error") if waiting else
+              ("await_approval" if pending_action else (out.get("outcome") or "error")),
         pending_action=pending_action,
         citations=[Citation(id=c["id"], title=c.get("title") or "") for c in out.get("citations") or []],
         tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])] + list(draft_calls),
         usage=out.get("usage") or None,
     )
+
+
+PREFERENCES_SAVE_FAILED_NOTE = ("I couldn't save your preference right now, so it was not saved. You can ask me again "
+                                "later.")
+PENDING_DRAFT_NOTE = "Your ticket draft is still waiting for your approval. Use Approve or Reject on the draft."
+# Turns that must never save a preference: the request failed, or was refused or blocked by a policy.
+_NO_SAVE_OUTCOMES = {"error", "blocked", "policy_refusal", "busy", "identity_mismatch"}
+
+
+async def _load_preferences(email: str | None) -> dict[str, str]:
+    """The saved preferences of this (session-locked) email, or {}. A database failure never fails the turn."""
+    store = getattr(app.state, "preferences", None)
+    if store is None or not email:
+        return {}
+    try:
+        return safe_presentation(await asyncio.to_thread(store.get, email))
+    except Exception:
+        log.exception("preferences: could not load them; the turn continues without")
+        return {}
+
+
+async def _save_preferences(raw_message: str, email: str | None, outcome: str | None,
+                            alive: Callable[[], bool] | None) -> str:
+    """Save the explicit persistent preferences in the employee's ORIGINAL message and return the note to add to
+    the reply ("" if nothing was saved). Never raises. The original text is used, not the redacted one: a message
+    that contained a secret saves nothing. Only fixed whitelist values are stored, never the message."""
+    store = getattr(app.state, "preferences", None)
+    if store is None or not email or outcome in _NO_SAVE_OUTCOMES or (alive is not None and not alive()):
+        return ""
+    wanted = extract_preferences(raw_message)
+    if not wanted:
+        return ""
+    try:
+        saved = await asyncio.to_thread(store.set_many, email, wanted)
+    except Exception:
+        log.exception("preferences: could not save them")
+        return PREFERENCES_SAVE_FAILED_NOTE
+    log.info("preferences: saved %s", ",".join(sorted(saved)))
+    return (f"Saved to your preferences: {describe_preferences(saved)}. This only changes how I write answers, "
+            "and you can clear it at any time.")
 
 
 DRAFT_IDENTITY_REPLY = ("I couldn't prepare the ticket draft, because this conversation isn't linked to the work "
@@ -537,6 +649,224 @@ async def _propose_turn_draft(session_id: str, session: dict,
         raise
     log.info("chat session=%s: ticket draft %s waiting for approval", session_ref(session_id), action.action_id)
     return action, calls, None
+
+
+# ---------------------------------------------------------------- WebSocket chat: /ws/chat
+# One connection is one turn. The client connects, sends ONE text frame, reads events until `final` or `error`,
+# and the server closes. The turn is the very same _chat() as POST /api/chat (identity lock, memory, redaction,
+# graph, draft proposal, token issuance, persistence); only the transport differs. The WebSocket never creates
+# a ticket: a draft arrives as pending_action in `final`, and only POST /api/approve files it.
+#
+# Client -> server, one JSON frame (sent within WS_FIRST_MESSAGE_SECONDS of connecting):
+#   {"type": "chat", "session_id": "...", "message": "...", "user": {"email": "..."}, "token": "..."}
+#   The fields session_id / message / user follow ChatRequest exactly. `token` is the session token; it may also
+#   come in the X-Session-Token handshake header or the session cookie (header, then `token`, then cookie).
+#   A NEW conversation sends no token. An existing one (it has a checkpoint) must send its token, which is
+#   stricter than /api/chat today and the same rule as /api/approve. The token is never in the URL.
+#
+# Server -> client, JSON frames, in this order. Every event has "turn_id" (one per connection) and "seq" (1, 2, 3 ...
+# strictly increasing over all events of the turn):
+#   {"type": "status", "stage": "...", "label": "..."}       zero or more, before the first chunk: which stage of the
+#                                                            run just started (employee | knowledge_base | evaluating
+#                                                            | preparing | generating | ticket). Fixed generic labels,
+#                                                            no data; transient: show the latest, never store it, and
+#                                                            drop it when the first chunk or the final arrives
+#   {"type": "chunk",   "text": "...", "provisional": true}   zero or more; append to the open answer bubble
+#   {"type": "retract", "reason": "..."}                     at most one; remove all chunks shown so far
+#   {"type": "final", "provisional": false, "display": "keep" | "replace", ...ChatResponse fields...,
+#                     "session_token": "..."}                exactly one, the authoritative answer. Streamed text is
+#                                                            provisional: the client must show `reply` from here
+#                                                            ("keep" means the chunks already equal it).
+#                                                            session_token appears only on the first turn of a new
+#                                                            conversation; keep it, never log or display it.
+#   {"type": "error", "code": "...", "message": "..."}       instead of final: invalid_request | unauthorized |
+#                                                            busy | timeout | unavailable | internal
+# Chunks are shown before the reply is verified (see app/agent/streaming.py). If the verified reply differs
+# from what was streamed, a retract is sent before `final`.
+#
+# Origin: a browser always sends it, so when present it must be in WS_ALLOWED_ORIGINS (default: the local Gradio
+# UI and this app on localhost / 127.0.0.1). A client without an Origin header (not a browser) is allowed.
+# If the client disconnects mid-turn the turn still finishes and is saved (so the stored conversation is
+# never half-written), nothing more is sent, and the session lock is released as usual. The turn's time is
+# bounded (answer stream timeout, MCP timeouts).
+WS_FIRST_MESSAGE_SECONDS = float(os.getenv("WS_FIRST_MESSAGE_SECONDS") or 10)
+WS_SEND_TIMEOUT_SECONDS = float(os.getenv("WS_SEND_TIMEOUT_SECONDS") or 10)
+WS_MAX_FRAME_CHARS = 16_000
+WS_POLICY_VIOLATION = 1008
+WS_REQUEST_FIELDS = {"type", "session_id", "message", "user", "token"}
+WS_ERROR_MESSAGES = {
+    "invalid_request": "The message was not a valid chat request, so nothing was done.",
+    "busy": ("I'm still working on an earlier message in this conversation, so I did not read this one. "
+             "Please send it again in a moment."),
+    "timeout": "No chat message arrived in time, so the connection was closed.",
+    "unavailable": "The assistant is not ready yet. Please try again in a moment.",
+    "internal": "Sorry, something went wrong on our side and I could not answer. Please try again in a moment.",
+}
+
+
+def ws_allowed_origins() -> set[str]:
+    configured = os.getenv("WS_ALLOWED_ORIGINS")
+    if configured is not None:
+        return {o.strip().lower().rstrip("/") for o in configured.split(",") if o.strip()}
+    ui_port = os.getenv("UI_PORT") or "7860"
+    return {f"http://{host}:{port}" for host in ("localhost", "127.0.0.1") for port in (ui_port, "8000")}
+
+
+class WSTurn:
+    """The events of one WebSocket turn: numbers them, tracks what the client has been shown, never raises."""
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.turn_id = uuid.uuid4().hex[:16]
+        self.timer = timing.start_turn(self.turn_id)     # diagnostics only: names and milliseconds, no content
+        self.seq = 0
+        self.chunks: list[str] = []
+        self.retracted = False
+        self.alive = True              # False after a failed send: the client is gone, the turn still completes
+
+    async def send(self, event: dict) -> bool:
+        if not self.alive:
+            return False
+        self.seq += 1
+        try:
+            await asyncio.wait_for(self.ws.send_json({**event, "turn_id": self.turn_id, "seq": self.seq}),
+                                   WS_SEND_TIMEOUT_SECONDS)
+        except Exception:
+            self.alive = False
+            return False
+        return True
+
+    async def emit(self, event: dict) -> None:
+        """Called by run_graph with the graph's status events and the answer node's provisional events."""
+        if event["type"] == STATUS:
+            # Rebuilt from the stage, so only the fixed generic label can ever leave; useless once text is flowing.
+            if event.get("stage") in STATUS_LABELS and not self.chunks and not self.retracted:
+                if await self.send(status_event(event["stage"])):
+                    self.timer.mark("ws_first_status_sent")
+        elif event["type"] == CHUNK and not self.retracted:
+            if await self.send({"type": CHUNK, "text": event["text"], "provisional": True}):
+                self.chunks.append(event["text"])
+                self.timer.mark("ws_first_chunk_sent")
+        elif event["type"] == RETRACT:
+            await self.retract(str(event.get("reason") or "retracted"))
+
+    async def retract(self, reason: str) -> None:
+        if self.chunks and not self.retracted:
+            self.retracted = True
+            await self.send(retract_event(reason))
+
+    async def final(self, result: ChatResponse, token: str | None) -> None:
+        """The authoritative answer, after every post-graph check. Reconciles anything streamed first."""
+        same = reconcile(self.chunks, self.retracted, result.reply) == "keep"
+        if self.chunks and not same:
+            await self.retract("reconciled")
+        event = {"type": "final", "provisional": False, "display": "keep" if same else "replace",
+                 **result.model_dump()}
+        if token:
+            event["session_token"] = token
+        await self.send(event)
+        self.timer.mark("ws_final_sent")
+        self.timer.log_summary(chunks=len(self.chunks), state=str(result.state), display=event["display"])
+
+    async def error(self, code: str, message: str | None = None) -> None:
+        await self.retract(code)
+        await self.send({"type": "error", "code": code, "message": message or WS_ERROR_MESSAGES[code]})
+
+
+async def ws_close(ws: WebSocket, code: int = 1000) -> None:
+    try:
+        await ws.close(code=code)
+    except Exception:           # already closed by the client
+        pass
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(ws: WebSocket) -> None:
+    origin = ws.headers.get("origin")
+    if origin is not None and origin.strip().lower().rstrip("/") not in ws_allowed_origins():
+        log.warning("websocket refused: origin not allowed")
+        await ws.close(code=WS_POLICY_VIOLATION)            # before accept: the handshake gets HTTP 403
+        return
+    turn = WSTurn(ws)                      # starts the turn timer: ws_accept_start..ws_accepted is the handshake
+    turn.timer.mark("ws_accept_start")
+    await ws.accept()
+    turn.timer.mark("ws_accepted")
+    try:
+        try:
+            frame = await asyncio.wait_for(ws.receive(), WS_FIRST_MESSAGE_SECONDS)
+        except TimeoutError:
+            await turn.error("timeout")
+            await ws_close(ws, WS_POLICY_VIOLATION)
+            return
+        text = frame.get("text")
+        if frame.get("type") != "websocket.receive" or not isinstance(text, str):
+            if frame.get("type") != "websocket.disconnect":
+                await turn.error("invalid_request")
+            await ws_close(ws, WS_POLICY_VIOLATION)
+            return
+        parsed = parse_ws_request(text)
+        if parsed is None:
+            await turn.error("invalid_request")
+            await ws_close(ws, WS_POLICY_VIOLATION)
+            return
+        turn.timer.mark("ws_request_received")
+        req, body_token = parsed
+        if getattr(app.state, "graph", None) is None:
+            await turn.error("unavailable")
+            await ws_close(ws, WS_POLICY_VIOLATION)
+            return
+
+        token = ws.headers.get(SESSION_TOKEN_HEADER) or body_token or ws.cookies.get(session_cookie_name(req.session_id))
+        session = get_session(req.session_id)
+        try:
+            async with session_turn(session):
+                try:
+                    await load_session(req.session_id, session)
+                except Exception:
+                    log.exception("ws session=%s: could not load the saved conversation", session_ref(req.session_id))
+                    await turn.error("internal")
+                    return
+                # An existing conversation must prove itself; only a brand-new one is claimed by this turn.
+                if session["stored"] or session["token_hash"]:
+                    problem = token_problem(session, token)
+                    if problem:
+                        log.warning("ws session=%s refused: %s session token", session_ref(req.session_id), problem)
+                        await turn.error("unauthorized", UNAUTHORIZED_REPLY[problem])
+                        await ws_close(ws, WS_POLICY_VIOLATION)
+                        return
+                issued = Response()
+                result = await _chat(req, session, issued, turn.emit,
+                                     alive=lambda: turn.alive and ws.client_state == WebSocketState.CONNECTED)
+                await turn.final(result, issued.headers.get(SESSION_TOKEN_HEADER))
+        except SessionBusy:
+            log.info("ws session=%s busy: an earlier request is still running", session_ref(req.session_id))
+            await turn.error("busy")
+        await ws_close(ws)
+    except Exception:
+        log.exception("ws: the turn failed")
+        await turn.error("internal")
+        await ws_close(ws, WS_POLICY_VIOLATION)
+
+
+def parse_ws_request(text: str) -> tuple[ChatRequest, str | None] | None:
+    """The chat request and the optional token from the first frame, or None if it is not valid. The same
+    ChatRequest rules as /api/chat (session id pattern, message length, email); nothing of the frame is echoed."""
+    if len(text) > WS_MAX_FRAME_CHARS:
+        return None
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or not set(body) <= WS_REQUEST_FIELDS or body.get("type", "chat") != "chat":
+        return None
+    token = body.get("token")
+    if token is not None and (not isinstance(token, str) or len(token) > 256):
+        return None
+    try:
+        req = ChatRequest.model_validate({k: v for k, v in body.items() if k in ("session_id", "message", "user")})
+    except ValidationError:
+        return None
+    return req, token
 
 
 @app.post("/api/approve", response_model=ChatResponse)
@@ -679,10 +1009,77 @@ def admin_token_ok(token: str | None) -> bool:
     return bool(expected) and secrets.compare_digest(token or "", expected)
 
 
+_SESSION_ID = TypeAdapter(SessionId)
+SESSION_ID_HEADER = "X-Session-Id"
+
+
+async def _preferences_owner(request: Request, session_id: str | None) -> tuple[PreferenceStore, str]:
+    """(store, email) for the employee this session is locked to, or an HTTPException. The target is never
+    chosen by the caller: it is the session's own email, and the session must present its CURRENT token
+    (header or cookie; an expired or unknown one is refused, unlike /reset which accepts an expired one)."""
+    store = getattr(app.state, "preferences", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Preferences are not available right now.")
+    try:
+        session_id = _SESSION_ID.validate_python(session_id)
+    except ValidationError:
+        raise HTTPException(status_code=400, detail=f"Send this conversation's id in the {SESSION_ID_HEADER} header.")
+    session = get_session(session_id)
+    try:
+        async with session_turn(session):
+            try:
+                await load_session(session_id, session)
+            except Exception:
+                log.exception("preferences session=%s: could not load the saved conversation", session_ref(session_id))
+                raise HTTPException(status_code=500, detail="The conversation could not be checked.")
+            problem = token_problem(session, presented_token(request, session_id))
+            if problem:
+                log.warning("preferences session=%s refused: %s session token", session_ref(session_id), problem)
+                raise HTTPException(status_code=401 if problem == "missing" else 403,
+                                    detail="This request needs this conversation's current session token.")
+            email = (session["user"] or {}).get("email")
+    except SessionBusy:
+        raise HTTPException(status_code=409, detail="This conversation is busy. Try again in a moment.")
+    if not email:
+        raise HTTPException(status_code=404, detail="This conversation is not linked to an employee.")
+    return store, email
+
+
+@app.get("/preferences")
+async def get_preferences(request: Request, response: Response,
+                          x_session_id: str | None = Header(default=None)) -> dict:
+    """The saved presentation preferences of the employee this session is locked to ({} if none)."""
+    store, email = await _preferences_owner(request, x_session_id)
+    try:
+        preferences = await asyncio.to_thread(store.get, email)
+    except Exception:
+        log.exception("preferences: could not read them")
+        raise HTTPException(status_code=503, detail="Preferences are not available right now.")
+    response.headers["Cache-Control"] = "no-store"
+    return {"preferences": safe_presentation(preferences)}
+
+
+@app.post("/preferences/reset")
+async def reset_preferences(request: Request, response: Response,
+                            x_session_id: str | None = Header(default=None)) -> dict:
+    """Delete the saved preferences of the employee this session is locked to, and only theirs. The conversation,
+    its history, a pending ticket draft and every other employee are untouched. There is no all-users form."""
+    store, email = await _preferences_owner(request, x_session_id)
+    try:
+        deleted = await asyncio.to_thread(store.delete, email)
+    except Exception:
+        log.exception("preferences: could not delete them")
+        raise HTTPException(status_code=503, detail="Your preferences could not be cleared. Nothing was changed.")
+    log.info("preferences session=%s: %d deleted", session_ref(x_session_id), deleted)
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "ok", "deleted": deleted}
+
+
 @app.post("/reset")
 async def reset(request: Request, response: Response, req: ResetRequest | None = None,
                 x_admin_token: str | None = Header(default=None)) -> dict:
-    """Clear our app's session state and saved conversations. Never touches the knowledge base or the helpdesk API.
+    """Clear our app's session state and saved conversations. Never touches the knowledge base, the helpdesk API or
+    the long-term preferences (POST /preferences/reset clears those, per employee).
 
     One session: its in-memory state and its checkpoint thread (messages, user_email, token) are deleted, so the
     same session id starts fresh, even for another employee. A conversation with a session token can only be

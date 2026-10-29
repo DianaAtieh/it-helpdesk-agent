@@ -25,6 +25,34 @@ class FakeChat:
         return LLMReply(data=dict(reply), usage=dict(self.usage), ms=1)
 
 
+class FakeStreamChat(FakeChat):
+    """FakeChat that can also stream. Each script is a list of deltas; an Exception item is raised at that point
+    and a callable item is awaited (to hang or to pace the stream). complete_json still works, as the fallback."""
+
+    def __init__(self, *scripts: list, json_replies: tuple = ({"reply": "ok", "citations": []},),
+                 usage: dict | None = None) -> None:
+        super().__init__(*json_replies, usage=usage)
+        self.scripts = list(scripts)
+        self.stream_calls: list[dict] = []
+        self.closed = 0
+
+    async def stream_text(self, system: str, user: str, *, usage: dict | None = None):
+        self.stream_calls.append({"system": system, "user": user})
+        script = self.scripts[min(len(self.stream_calls), len(self.scripts)) - 1]
+        try:
+            for item in script:
+                if isinstance(item, Exception):
+                    raise item
+                if callable(item):
+                    await item()
+                else:
+                    yield item
+            if usage is not None:
+                usage.update(self.usage)
+        finally:
+            self.closed += 1
+
+
 def evidence(doc_id: str, text: str, *, title: str = "", source: str = "evidence",
              chunk_id: str | None = None) -> dict:
     """One evidence record, shaped like app.agent.retrieval.evidence_record."""
@@ -57,4 +85,5 @@ class FakeKnowledgeBase:
         return self.result
 
 
-__all__ = ["FakeChat", "FakeKnowledgeBase", "KnowledgeBaseError", "LLMError", "evidence", "kb_result"]
+__all__ = ["FakeChat", "FakeKnowledgeBase", "FakeStreamChat", "KnowledgeBaseError", "LLMError", "evidence",
+           "kb_result"]

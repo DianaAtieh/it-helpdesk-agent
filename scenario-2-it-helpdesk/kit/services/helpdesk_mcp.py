@@ -12,8 +12,10 @@ The knowledge base is NOT exposed here: retrieval over dataset/knowledge_base is
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -61,12 +63,44 @@ def _invalid(field: str, what: str) -> dict:
 
 
 _load_dotenv()
-API_URL = (os.getenv("HELPDESK_API_URL") or "http://localhost:8102").rstrip("/")
+API_URL = (os.getenv("HELPDESK_API_URL") or "http://127.0.0.1:8102").rstrip("/")   # not "localhost": on Windows it tries ::1 first, ~2 s
 API_KEY = os.getenv("HELPDESK_API_KEY") or "dev-key-change-me"
 TIMEOUT_S = float(os.getenv("HELPDESK_TIMEOUT_S") or 20)
 
+# One HTTP client for the whole server process: building an httpx client costs ~350 ms (measured), so a client
+# per call made every tool call slow. It is bound to the event loop that created it and closed on shutdown.
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _shared_client() -> httpx.AsyncClient:
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
+        _client = httpx.AsyncClient(base_url=API_URL, timeout=TIMEOUT_S)
+        _client_loop = loop
+    return _client
+
+
+async def _close_client() -> None:
+    global _client, _client_loop
+    client, _client, _client_loop = _client, None, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+@asynccontextmanager
+async def _lifespan(_server):
+    _shared_client()   # build it at start-up (~0.5 s: TLS trust store, pools), not inside the first employee's request
+    try:
+        yield
+    finally:
+        await _close_client()
+
+
 mcp = FastMCP(
     "nakhla-helpdesk",
+    lifespan=_lifespan,
     log_level=os.getenv("HELPDESK_MCP_LOG_LEVEL") or "WARNING",  # INFO logs every request on stderr
     instructions=(
         "Tools for the simulated IT helpdesk of Nakhla Systems (a fictional company): employee directory, "
@@ -80,9 +114,9 @@ async def _call(method: str, path: str, *, params: dict | None = None, body: dic
                 headers: dict | None = None) -> tuple[bool, Any]:
     """Call the REST API. Returns (ok, data_or_error)."""
     try:
-        async with httpx.AsyncClient(base_url=API_URL, timeout=TIMEOUT_S) as client:
-            r = await client.request(method, path, params={k: v for k, v in (params or {}).items() if v is not None},
-                                     json=body, headers={"X-API-Key": API_KEY, **(headers or {})})
+        r = await _shared_client().request(method, path,
+                                           params={k: v for k, v in (params or {}).items() if v is not None},
+                                           json=body, headers={"X-API-Key": API_KEY, **(headers or {})})
     except httpx.TimeoutException:
         return False, {"code": "timeout", "message": f"The helpdesk API did not answer within {TIMEOUT_S:.0f} s. "
                                                      "Nothing is confirmed."}
