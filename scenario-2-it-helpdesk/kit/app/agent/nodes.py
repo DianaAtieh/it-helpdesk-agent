@@ -207,12 +207,34 @@ def service_status_reply(state: AgentState) -> str:
         lines.append(line)
         for incident in [i for i in incidents if _clean(i.get("service"), 40).lower() == service["id"]][:2]:
             detail = f"Active incident {_clean(incident.get('id'), 40)}: {_clean(incident.get('title')) or 'service problem'}."
+            # Status-page workarounds are general advice (e.g. switch gateway); they are withheld for VPN when
+            # department rules (Finance, Contractors) override them.
+            if service["id"] == "vpn" and vpn_restricted(state.get("employee")):
+                detail += " Your VPN access follows a department rule, so general workarounds do not apply to you."
+                if state.get("employee", {}).get("contractor"):
+                    detail += " Contractors do not use the VPN; see the VDI instructions."
+                else:
+                    detail += " Please contact Security Operations through the Service Desk."
+                lines.append(detail)
+                continue
             if incident.get("workaround"):
                 detail += f" Workaround: {_clean(incident['workaround'])}"
             if incident.get("instructions"):
                 detail += f" {_clean(incident['instructions'])}"
             lines.append(detail)
     return "\n".join(lines)
+
+
+def vpn_restricted(employee: dict | None) -> bool:
+    """Finance (KB-002 / KB-016: Security Operations, no client steps, GW-3 only) and Contractors (SP-002: no VPN)
+    never get the general VPN troubleshooting or gateway workarounds. From the directory record only."""
+    if not isinstance(employee, dict):
+        return False
+    return bool(employee.get("contractor")) or employee.get("department") == escalation.FINANCE
+
+
+def department_rule_applies(employee: dict | None, text: str, codes: list[str]) -> bool:
+    return vpn_restricted(employee) and escalation.is_vpn_topic(text, codes)
 
 
 def match_incident(incidents: list[dict], text: str, codes: list[str]) -> dict | None:
@@ -259,13 +281,19 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
 
         codes = list(strict_codes(text))
         matched = match_incident(incidents, text, codes)
-        topics = [] if matched else status_question(text, state.get("messages") or [])
+        # Department and security rules come before the incident shortcut: a Finance or Contractor VPN problem and a
+        # request to break a security policy go on to the answer node, which holds those rules. The incident is kept
+        # out of state so the ticket flow does not treat it as covering this employee.
+        policy_hit = policy.check_request(text, employee, codes)
+        if matched and (policy_hit or department_rule_applies(employee, text, codes)):
+            matched = None
+        topics = [] if matched or policy_hit else status_question(text, state.get("messages") or [])
         # A message that is ONLY a persistent preference request ("From now on, use numbered steps.") is not an IT
         # problem: it skips the knowledge base, the embedding and the model. Every other route, a policy refusal and
         # a ticket request take precedence, and a mixed message is never preference-only (see is_preference_only).
         preference_only = (not matched and not topics and not codes and is_preference_only(text)
                            and not escalation.wants_ticket(state.get("messages") or [])
-                           and not policy.check_request(text, employee, codes))
+                           and not policy_hit)
         return {
             "employee": employee,
             "codes": codes,
@@ -510,7 +538,7 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
             return {**result(granted.reply, access.OUTCOME), "policy_citations": granted.citations}
         # Finance VPN (KB-002 "Exceptions", KB-016): Finance staff are not walked through the client. The fixed reply
         # sends the problem to Security Operations and offers the security ticket. It uses the same VPN check as the
-        # ticket rule (escalation.is_vpn_topic); incidents and explicit ticket requests never reach this node.
+        # ticket rule (escalation.is_vpn_topic). Triage keeps an active incident off the incident route for Finance.
         directory = state.get("employee")
         if (isinstance(directory, dict) and directory.get("department") == escalation.FINANCE
                 and not directory.get("contractor") and escalation.is_vpn_topic(latest_user_text(state), codes)):

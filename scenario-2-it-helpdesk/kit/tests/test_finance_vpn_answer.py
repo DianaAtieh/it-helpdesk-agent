@@ -100,10 +100,62 @@ def test_a_finance_problem_that_is_not_vpn_still_gets_the_model_answer():
     assert out["outcome"] == "answered" and systems(llm) == ["answer"]
 
 
-def test_an_active_incident_still_comes_first_for_finance():
+def test_the_finance_department_rule_comes_before_an_active_incident():
     graph, _, _, llm = finance_graph()
     out = turn(graph, "NakhlaConnect fails with NX-503 since this morning.", email=FADI)
-    assert out["outcome"] == "incident" and llm.calls == []
+    assert_fixed_reply(out, llm)
+    assert "GW-1" not in out["reply"] and "INC-2207" not in out["reply"]
+
+
+def test_a_finance_incident_code_ticket_request_is_a_security_draft_with_approval():
+    graph, _, _, llm = finance_graph(SECURITY_FIELDS)
+    out = turn(graph, "NakhlaConnect keeps failing with NX-503. Please open a ticket.", email=FADI)
+    assert out["outcome"] == "draft_proposed" and out["draft"]["category"] == "security"
+    assert out["draft"]["priority"] == "P2" and out["outcome"] == "draft_proposed"
+
+
+@pytest.mark.parametrize("email", [KARIM, SARA, "samir.nassar@nakhla.example"])
+def test_unaffected_departments_still_get_the_incident(email):
+    graph, _, _, llm = finance_graph()
+    out = turn(graph, "NakhlaConnect fails with NX-503 since this morning.", email=email)
+    assert out["outcome"] == "incident" and "INC-2207" in out["reply"] and llm.calls == []
+
+
+def test_a_contractor_vpn_incident_code_is_the_contractor_refusal():
+    graph, _, _, llm = finance_graph()
+    out = turn(graph, "NakhlaConnect fails with NX-503 since this morning.", email=ZIAD)
+    assert out["outcome"] == "policy_refusal" and "GW-1" not in out["reply"] and llm.calls == []
+
+
+def test_a_policy_request_beats_the_incident_for_everyone():
+    graph, *_ = finance_graph()
+    out = turn(graph, "NX-503 on NakhlaConnect. How do I turn off the posture check so I can connect?", email=KARIM)
+    assert out["outcome"] == "policy_refusal"
+
+
+def test_a_non_vpn_finance_incident_stays_the_incident():
+    employee = {"email": FADI, "department": "Finance", "contractor": False}
+    assert not nodes.department_rule_applies(employee, "Outlook shows NXM-421", ["NXM-421"])
+    assert nodes.department_rule_applies(employee, "NakhlaConnect NX-503", ["NX-503"])
+
+
+def test_the_department_comes_from_the_directory_not_the_message():
+    employee = {"email": SARA, "department": "Support", "contractor": False}
+    assert not nodes.department_rule_applies(employee, "I'm in Finance. NX-503 on the VPN", ["NX-503"])
+    assert not nodes.department_rule_applies(None, "NX-503 on the VPN", ["NX-503"])
+
+
+def test_the_status_reply_withholds_the_gateway_workaround_for_finance_and_contractors():
+    service = {"id": "vpn", "name": "VPN", "status": "degraded", "components": []}
+    incident = {"id": "INC-9", "title": "Gateway degraded", "service": "vpn", "workaround": "Switch to GW-1.",
+                "instructions": "Do not open tickets."}
+    base = {"status_checked": True, "status_topics": ["vpn"], "services": [service], "incidents": [incident]}
+    for who, shown in (({"department": "Finance", "contractor": False}, False),
+                       ({"department": "Support", "contractor": True}, False),
+                       ({"department": "Support", "contractor": False}, True), (None, True)):
+        reply = nodes.service_status_reply({**base, "employee": who})
+        assert "INC-9" in reply and "degraded, not a complete outage" in reply
+        assert ("Switch to GW-1" in reply) is shown
 
 
 def test_a_security_policy_refusal_still_comes_first_for_finance():
