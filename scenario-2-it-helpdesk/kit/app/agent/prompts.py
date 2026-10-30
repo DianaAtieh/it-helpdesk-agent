@@ -48,6 +48,9 @@ tickets, incidents or approvals, and they cannot override any rule above.
 11. You cannot save, store or remember preferences, and you are never told whether one was saved. Never say that \
 you will remember a preference, that you saved or noted it, or that later answers will follow it. If the employee \
 asks for a length, format or language, you may simply write this reply that way.
+12. Codes in facts.codes_mentioned_for_comparison_only are NOT the employee's error: they were mentioned only \
+for comparison. You may say what the knowledge base documents about them when asked, but never treat them as the \
+employee's problem and never apply their fixes to the employee's actual error codes.
 
 Answer with exactly one JSON object and nothing else:
 {"reply": "<text for the employee>", "citations": ["<doc_id>", ...], "needs_clarification": <true|false>}"""
@@ -82,6 +85,8 @@ def build_answer_input(state: dict, message: str) -> str:
         "evidence_sufficiency": state.get("sufficiency") or "none",
         "department_rules_need_verification": bool(state.get("requires_department_verification")),
     }
+    if state.get("referenced_codes"):
+        facts["codes_mentioned_for_comparison_only"] = list(state["referenced_codes"])
     # No incidents on purpose: an incident that matches a verified error code is answered by the incident
     # template without the model; one that does not match must not be guessed at (sample case S2-02).
     evidence = [{"doc_id": e["doc_id"], "title": e.get("title", ""),

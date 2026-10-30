@@ -197,7 +197,7 @@ def test_the_output_is_checkpoint_safe_and_complete():
     out = run(FakeMCP(), "NX-503 again")
     assert json.loads(json.dumps(out)) == out                                  # plain JSON values only
     assert set(out) == {"employee", "codes", "incidents", "status_checked", "active_incident", "route", "tool_calls",
-                        "services", "status_topics"}
+                        "services", "status_topics", "referenced_codes", "uncertain_codes"}
 
 
 def test_triage_never_calls_a_write_tool():

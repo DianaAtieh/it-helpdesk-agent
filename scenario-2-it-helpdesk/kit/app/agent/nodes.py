@@ -17,6 +17,7 @@ from langgraph.config import get_config, get_stream_writer
 
 from app import timing  # noqa: E402
 from app.agent import access, answer_verifier, escalation, policy
+from app.agent.codes import classify_codes, is_ambiguous, without_codes
 from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
@@ -237,9 +238,10 @@ def department_rule_applies(employee: dict | None, text: str, codes: list[str]) 
     return vpn_restricted(employee) and escalation.is_vpn_topic(text, codes)
 
 
-def match_incident(incidents: list[dict], text: str, codes: list[str]) -> dict | None:
-    """The first active incident that lists one of the user's error codes (strict or loose form), or None."""
-    candidates = set(codes) | loose_codes(text)
+def match_incident(incidents: list[dict], text: str, codes: list[str], exclude=frozenset()) -> dict | None:
+    """The first active incident that lists one of the user's error codes (strict or loose form), or None.
+    `exclude`: codes the employee only mentioned for comparison; they never match an incident."""
+    candidates = (set(codes) | loose_codes(text)) - set(exclude)
     for incident in incidents:
         if candidates & set(incident["error_codes"]):
             return incident
@@ -279,30 +281,46 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
         status_checked = bool(data.get("ok")) and isinstance(data.get("status"), dict)
         incidents = active_incidents(data) if status_checked else []
 
-        codes = list(strict_codes(text))
-        matched = match_incident(incidents, text, codes)
+        mentioned = list(strict_codes(text))
+        # Only the employee's own error codes drive incident matching, duplicate detection and the answer. A code
+        # mentioned for comparison ("is this the same as NX-503?") is kept apart in referenced_codes.
+        split = classify_codes(text)
+        not_actual = split.not_actual
+        codes = [c for c in mentioned if c not in not_actual]
+        ambiguous = is_ambiguous(split, text)
+        referenced = set(split.referenced) | set(classify_codes(search_query(state)).referenced)
+        referenced = sorted(referenced - set(codes))
+        matched = match_incident(incidents, text, codes, not_actual)
         # Department and security rules come before the incident shortcut: a Finance or Contractor VPN problem and a
         # request to break a security policy go on to the answer node, which holds those rules. The incident is kept
-        # out of state so the ticket flow does not treat it as covering this employee.
-        policy_hit = policy.check_request(text, employee, codes)
-        if matched and (policy_hit or department_rule_applies(employee, text, codes)):
+        # out of state so the ticket flow does not treat it as covering this employee. These restriction checks see
+        # every code mentioned, so a comparison can never lift one.
+        policy_hit = policy.check_request(text, employee, mentioned)
+        restricted = bool(policy_hit) or department_rule_applies(employee, text, mentioned)
+        if matched and restricted:
             matched = None
         topics = [] if matched or policy_hit else status_question(text, state.get("messages") or [])
+        wants_ticket = escalation.wants_ticket(state.get("messages") or [])
+        # No actual error code can be told from a comparison: ask which one, rather than treat every code as active.
+        # Ticket requests, policy refusals and department rules keep their own flows.
+        clarify_code = ambiguous and not matched and not restricted and not wants_ticket
         # A message that is ONLY a persistent preference request ("From now on, use numbered steps.") is not an IT
         # problem: it skips the knowledge base, the embedding and the model. Every other route, a policy refusal and
         # a ticket request take precedence, and a mixed message is never preference-only (see is_preference_only).
         preference_only = (not matched and not topics and not codes and is_preference_only(text)
-                           and not escalation.wants_ticket(state.get("messages") or [])
-                           and not policy_hit)
+                           and not wants_ticket and not policy_hit and not clarify_code)
         return {
             "employee": employee,
             "codes": codes,
+            "referenced_codes": referenced,
+            "uncertain_codes": list(split.uncertain) if ambiguous else [],
             "incidents": incidents,
             "status_checked": status_checked,
             "active_incident": matched,
             "services": status_services(data) if status_checked and topics else [],
             "status_topics": topics,
-            "route": "incident" if matched else "status" if topics else "preference" if preference_only else "retrieve",
+            "route": ("incident" if matched else "clarify" if clarify_code else "status" if topics
+                      else "preference" if preference_only else "retrieve"),
             "tool_calls": calls,
         }
 
@@ -311,8 +329,15 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
 
 def route_after_triage(state: AgentState) -> str:
     """The conditional edge after triage: "incident", "status" (a service status question), "preference" (a message
-    that only states a persistent preference) or "retrieve"."""
-    return state.get("route") if state.get("route") in ("incident", "status", "preference") else "retrieve"
+    that only states a persistent preference), "clarify" (several codes, none clearly the employee's own) or
+    "retrieve"."""
+    return state.get("route") if state.get("route") in ("incident", "status", "preference", "clarify") else "retrieve"
+
+
+def code_clarify_reply(state: AgentState) -> str:
+    listed = ", ".join(state.get("uncertain_codes") or [])
+    return (f"I see more than one error code in your message ({listed}) and I can't tell which one your device is "
+            f"actually showing. Which exact code do you see right now?")
 
 
 # What the employee sees before the backend's own "Saved to your preferences: ..." (or "could not save") note.
@@ -383,7 +408,11 @@ def retrieval_update(result, state: AgentState) -> dict:
     """The state fields a knowledge-base result produces (shared by retrieve and the evidence evaluator's retry,
     so a retried search goes through exactly the same filtering and coverage validation)."""
     found = result.to_state()
-    codes = list(dict.fromkeys([*(state.get("codes") or []), *found["codes"]]))
+    # Codes the employee only mentioned for comparison stay out of the codes the answer must cover and out of the
+    # undocumented ones: the answer is about the actual error (their evidence may still be retrieved).
+    referenced = set(state.get("referenced_codes") or [])
+    codes = [c for c in dict.fromkeys([*(state.get("codes") or []), *found["codes"]]) if c not in referenced]
+    found["undocumented_codes"] = [c for c in found["undocumented_codes"] if c not in referenced]
     # Security policies win (manifest rule 1): a non-SP chunk recommending a forbidden action never reaches
     # the model, the escalation's kb_refs or the verifier. SP chunks and prohibitions are kept.
     evidence, _dropped = policy.filter_evidence(found["evidence"])
@@ -764,8 +793,12 @@ def make_escalate(llm: ChatModel | None, mcp: MCPClient | None = None) -> Callab
             calls.append(call.model_dump())
             checked = bool(data.get("ok"))
             signals = escalation.history_signals(data.get("tickets")) if checked else []
-        duplicate = checked and escalation.open_duplicate(
-            signals, escalation.duplicate_text(state.get("messages") or []), state.get("codes") or [])
+        # Codes mentioned only for comparison never make a duplicate: compare on the employee's own codes.
+        dup_text = escalation.duplicate_text(state.get("messages") or [])
+        dup_split = classify_codes(dup_text)
+        dup_codes = [c for c in state.get("codes") or [] if c not in dup_split.not_actual]
+        duplicate = checked and escalation.open_duplicate(signals, without_codes(dup_text, dup_split.not_actual),
+                                                          dup_codes)
         log.info("memory: open_tickets=%d history_checked=%s duplicate=%s", len(signals), checked, duplicate)
         memory = {"open_ticket_signals": signals, "history_checked": checked, "tool_calls": calls}
         if duplicate:
@@ -944,6 +977,8 @@ def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState]
             reply, outcome, citations, usage = service_status_reply(state), "service_status", [], {}
         elif state.get("route") == "preference":
             reply, outcome, citations, usage = preference_reply(state), "preference", [], {}
+        elif state.get("route") == "clarify":
+            reply, outcome, citations, usage = code_clarify_reply(state), "clarify", [], {}
         else:
             titles: dict[str, str] = {}
             for record in state.get("evidence") or []:

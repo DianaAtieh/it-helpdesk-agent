@@ -34,6 +34,10 @@ class AgentState(TypedDict, total=False):
     #   status_topics   the services a status question names ([] otherwise)
     employee: dict | None
     codes: list[str]
+    # codes mentioned only for comparison ("is this the same as NX-503?"): never matched to incidents or tickets;
+    # uncertain_codes: the codes of a comparison none of which is clearly the employee's own (route "clarify").
+    referenced_codes: list[str]
+    uncertain_codes: list[str]
     incidents: list[dict]
     status_checked: bool
     route: str
