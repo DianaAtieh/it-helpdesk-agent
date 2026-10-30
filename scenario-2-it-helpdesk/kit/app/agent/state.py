@@ -80,6 +80,9 @@ class AgentState(TypedDict, total=False):
     # [{"codes": [...], "keywords": [...]}] (escalation.history_signals): never a ticket ID, subject, description,
     # note or email. history_checked is False when the lookup failed or was not made (then no duplicate check).
     open_ticket_signals: list[dict]
+    # AI verifier (build_graph(verify_answers=True)), set by respond on every turn: None when it did not run, else
+    # counts only ({applied, fallback, checked, removed, groundedness, reason, verdicts}), never answer text.
+    answer_verification: dict | None
     history_checked: bool
     # Escalate (Phase 4): a ticket draft PROPOSAL built by app.agent.escalation (TicketDraft-compatible plain
     # dict), only on the turn it was made (respond clears it on every other turn). It is not a ticket and not

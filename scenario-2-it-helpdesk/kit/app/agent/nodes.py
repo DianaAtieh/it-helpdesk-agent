@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from contextlib import aclosing
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -15,8 +16,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_config, get_stream_writer
 
 from app import timing  # noqa: E402
-from app.agent import escalation, policy
-from app.agent.preferences import is_preference_only
+from app.agent import access, answer_verifier, escalation, policy
+from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
                                build_escalation_input)
 from app.agent.streaming import AnswerStreamParser, chunk_event, final_event, retract_event, status_event
@@ -501,6 +502,21 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         refused = policy.check_request(latest_user_text(state), state.get("employee"), codes)
         if refused:
             return {**result(refused.reply, "policy_refusal"), "policy_citations": [refused.citation]}
+        # An access question about one known app or group gets the fixed KB-011 / KB-008 answer for this directory
+        # record (app/agent/access.py), with no model call. Its citations are issued by code like the refusal's.
+        granted = access.access_answer(latest_user_text(state), state.get("employee"))
+        if granted:
+            log.info("access: fixed answer for group %s", granted.group)
+            return {**result(granted.reply, access.OUTCOME), "policy_citations": granted.citations}
+        # Finance VPN (KB-002 "Exceptions", KB-016): Finance staff are not walked through the client. The fixed reply
+        # sends the problem to Security Operations and offers the security ticket. It uses the same VPN check as the
+        # ticket rule (escalation.is_vpn_topic); incidents and explicit ticket requests never reach this node.
+        directory = state.get("employee")
+        if (isinstance(directory, dict) and directory.get("department") == escalation.FINANCE
+                and not directory.get("contractor") and escalation.is_vpn_topic(latest_user_text(state), codes)):
+            log.info("finance vpn: fixed Security Operations reply, answer model not called")
+            return {**result(escalation.FINANCE_VPN_REPLY, FINANCE_VPN_OUTCOME),
+                    "policy_citations": finance_vpn_citations()}
         if state.get("kb_status") != "ok":
             return result(KB_UNAVAILABLE_REPLY, "error")
         # Nobody known and no error code: ask who they are and what they see before any answer (S2-02).
@@ -834,6 +850,34 @@ def employee_messages(state: AgentState) -> str:
     return "\n".join(str(m.content) for m in state.get("messages") or [] if isinstance(m, HumanMessage))
 
 
+def add_usage(first: dict, second: dict) -> dict:
+    """Token counts of two model calls added up (the answer and the AI verifier), for the response's usage."""
+    total = dict(first or {})
+    for key, value in (second or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+    return total
+
+
+FINANCE_VPN_OUTCOME = "finance_vpn"
+DEPARTMENT_RULE_SOURCE = "department_rule"
+FINANCE_VPN_DOCS = {"KB-002": "NakhlaConnect VPN: error codes and fixes",
+                    "KB-016": "Department IT matrix and exceptions"}
+
+
+def finance_vpn_citations() -> list[dict]:
+    """The Finance VPN reply's citations, issued by code: KB-002 ("Exceptions") and KB-016 (the Finance row)."""
+    return [{"id": doc_id, "title": title, "source": DEPARTMENT_RULE_SOURCE}
+            for doc_id, title in FINANCE_VPN_DOCS.items()]
+
+
+def valid_finance_vpn_citations(raw) -> list[dict]:
+    """Code-issued Finance VPN citations from this turn, kept only if they name KB-002 or KB-016 with this source."""
+    out = [{"id": c["id"], "title": FINANCE_VPN_DOCS[c["id"]], "source": DEPARTMENT_RULE_SOURCE} for c in raw or []
+           if isinstance(c, dict) and c.get("id") in FINANCE_VPN_DOCS and c.get("source") == DEPARTMENT_RULE_SOURCE]
+    return list({c["id"]: c for c in out}.values())
+
+
 def valid_policy_citations(raw) -> list[dict]:
     """Code-issued citations from this turn, kept only if they name an SP document of a policy rule."""
     allowed = set(policy.RULE_DOC.values())
@@ -846,12 +890,15 @@ def valid_policy_citations(raw) -> list[dict]:
     return list({c["id"]: c for c in out}.values())
 
 
-def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
+def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState], Awaitable[dict]]:
     """The node that ends every turn (FINAL_NODE): one place that checks what leaves the agent.
 
       * a verified active incident gets the status-page template (no citations, no model);
       * otherwise the answer node's reply: citations kept only if they are documents in THIS turn's evidence,
         and an "answered" reply left with no valid citation is replaced by the honest fallback;
+      * with verifier_llm (build_graph(verify_answers=True)), a model-written answer that passed every code check
+        is also judged by the AI verifier (app/agent/answer_verifier.py): it may only drop whole sentences or ask
+        for the fallback; if it is unavailable or invalid, the code-verified answer stands. Never for fixed replies;
       * always: secrets redacted, invented ticket IDs and "ticket created" claims removed, non-empty, bounded;
       * a ticket draft proposal survives only on the turn escalate made it (outcome "draft_proposed"); on every
         other turn it is cleared, so an old draft can never be picked up later.
@@ -861,6 +908,8 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         incident = state.get("active_incident")
         draft = None
         policy_citations: list[dict] = []
+        tool_calls = list(state.get("tool_calls") or [])   # this turn's calls so far; the AI verifier adds its own
+        verification: dict | None = None
         if state.get("route") == "incident" and isinstance(incident, dict) and incident.get("id"):
             reply, outcome, citations, usage = incident_reply(incident), "incident", [], {}
         elif state.get("route") == "status":
@@ -894,8 +943,34 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
                     reply, citations = checked.reply, checked.citations
                     if checked.fallback:
                         outcome = "not_documented"
+            if outcome == "answered":                       # only the backend may say a preference was saved
+                reply, claims = strip_preference_claims(reply)
+                if claims:
+                    log.info("preferences: removed %d preference-saving claim(s) from the model answer", claims)
+                    if not reply.strip():                   # the answer was nothing but the claim
+                        reply, outcome, citations = preference_reply(state), "preference", []
+            if outcome == "answered" and verifier_llm is not None:   # the AI verifier, after every code check
+                started = time.perf_counter()
+                judged = await answer_verifier.verify_with_llm(
+                    verifier_llm, reply, evidence=list(state.get("evidence") or []), employee=state.get("employee"),
+                    rule_coverage=state.get("rule_coverage"), employee_message=latest_user_text(state),
+                    fallback_reply=UNGROUNDED_REPLY, citations=citations)
+                tool_calls.append({"tool": answer_verifier.VERIFY_TOOL, "ok": judged.applied,
+                                   "ms": round((time.perf_counter() - started) * 1000)})
+                verification = {"applied": judged.applied, "fallback": judged.fallback, "checked": judged.checked,
+                                "removed": len(judged.removed), "groundedness": judged.groundedness,
+                                "reason": judged.reason, "verdicts": dict(judged.verdicts)}   # counts only, no text
+                usage = add_usage(usage, judged.usage)
+                if judged.applied:                          # citations of only dropped sentences are gone too
+                    reply, citations = judged.reply, judged.citations
+                    if judged.fallback:                     # the honest fallback cites nothing
+                        outcome, citations = "not_documented", []
             if outcome == "policy_refusal" and not policy_citations:
                 policy_citations = valid_policy_citations(state.get("policy_citations"))
+            if outcome == access.OUTCOME:                   # code-issued KB-008 / KB-011 citations only
+                policy_citations = access.valid_citations(state.get("policy_citations"))
+            if outcome == FINANCE_VPN_OUTCOME:              # code-issued KB-002 / KB-016 citations only
+                policy_citations = valid_finance_vpn_citations(state.get("policy_citations"))
             if outcome == "draft_proposed" and isinstance(state.get("draft"), dict):
                 draft = dict(state["draft"])
         reply = safe_reply(reply)
@@ -905,7 +980,11 @@ def make_respond() -> Callable[[AgentState], Awaitable[dict]]:
         writer = stream_writer(config)
         if writer:                  # the authoritative end of a streamed turn: replaces any provisional chunks
             writer(final_event(reply, shown, outcome))
-        return {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
-                "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft}
+        out = {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
+               "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft,
+               "answer_verification": verification}
+        if verification is not None:                # only a verified turn changes this turn's tool calls
+            out["tool_calls"] = tool_calls
+        return out
 
     return respond

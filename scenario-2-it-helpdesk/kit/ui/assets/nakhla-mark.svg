@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Nakhla">
+  <path d="M32 3 L55 11.5 V30 C55 45.5 45 55.5 32 61 C19 55.5 9 45.5 9 30 V11.5 Z" fill="#123C32"/>
+  <path d="M32 3 L55 11.5 V30 C55 45.5 45 55.5 32 61 C19 55.5 9 45.5 9 30 V11.5 Z" fill="none" stroke="#237A57" stroke-width="1.6"/>
+  <path d="M32 29 C26.5 20 18.5 18 13.5 21 C19.5 21.6 26 24.6 32 29 Z" fill="#DCE9DF"/>
+  <path d="M32 29 C37.5 20 45.5 18 50.5 21 C44.5 21.6 38 24.6 32 29 Z" fill="#DCE9DF"/>
+  <path d="M32 29 C28.6 22.5 26.8 15.5 21.5 11.5 C25.6 17.5 28.6 23 32 29 Z" fill="#9CC5AA"/>
+  <path d="M32 29 C35.4 22.5 37.2 15.5 42.5 11.5 C38.4 17.5 35.4 23 32 29 Z" fill="#9CC5AA"/>
+  <path d="M32 29 C31 22 31 15 32 9.5 C33 15 33 22 32 29 Z" fill="#DCE9DF"/>
+  <path d="M32 29 C25.5 28 19.5 31 16.5 36.5 C21.5 33 26.5 30.6 32 29 Z" fill="#9CC5AA"/>
+  <path d="M32 29 C38.5 28 44.5 31 47.5 36.5 C42.5 33 37.5 30.6 32 29 Z" fill="#9CC5AA"/>
+  <path d="M32 31 C31.2 38.5 31.2 45.5 32 53" fill="none" stroke="#DCE9DF" stroke-width="3" stroke-linecap="round"/>
+  <path d="M32 46 H40.5 V41.5 M32 50.5 H23.5 V46" fill="none" stroke="#D5A84F" stroke-width="1.4" stroke-linecap="round"/>
+  <circle cx="40.5" cy="40.5" r="1.9" fill="#D5A84F"/>
+  <circle cx="23.5" cy="45" r="1.9" fill="#D5A84F"/>
+  <circle cx="32" cy="30" r="2.2" fill="#D5A84F"/>
+</svg>
