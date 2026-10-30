@@ -50,7 +50,8 @@ KB009 = evidence("KB-009", "SWC-2001: licence pool exhausted. Ask for a licence.
 FIELDS = {"subject": "SWC-2001 installing NakhlaCode Studio",
           "description": "Software Center shows SWC-2001 when installing NakhlaCode Studio.",
           "category": "software", "priority": "P3", "attempted_steps": ["Tried again after a restart"],
-          "kb_refs": ["KB-009"], "affected_users": 1}
+          "kb_refs": ["KB-009"], "affected_users": 1, "device_type": "laptop",
+          "operating_system": "Windows 11"}
 MEMORY_LOG = re.compile(r"^memory: open_tickets=\d+ history_checked=(True|False) duplicate=(True|False)$")
 
 

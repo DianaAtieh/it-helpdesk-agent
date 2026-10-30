@@ -205,9 +205,10 @@ def test_graph_blocked_turn_then_ticket_request_still_needs_approval():
     assert first["draft"] is None and first["citations"] == [] and llm.calls == []
 
     second = esc_turn(graph, "I did all of that and it still shows NX-112. Please open a ticket.", thread="tk-1")
-    assert second["outcome"] == "draft_proposed" and second["reply"] == DRAFT_READY_REPLY
+    assert second["outcome"] == "draft_proposed" and second["reply"].startswith(DRAFT_READY_REPLY)
     assert second["citations"] == []
-    assert "Sync" not in second["reply"] and "restart" not in second["reply"].lower()     # no KB-002 steps shown
+    advice = second["reply"].split("Ticket summary:")[0]      # the summary lists the employee's own tried steps
+    assert "Sync" not in advice and "restart" not in advice.lower()     # no KB-002 steps shown
     assert esc_systems(llm) == ["escalate"]                                  # the answer model never ran
     draft = second["draft"]
     assert draft["requester_email"] == ESC_SARA and draft["department"] == "Support"       # set in code

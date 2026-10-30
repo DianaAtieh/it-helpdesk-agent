@@ -48,9 +48,10 @@ from app.agent.streaming import (CHUNK, RETRACT, STATUS, STATUS_LABELS, reconcil
                                  status_event)
 from app.guardrails import WITHHELD, looks_like_instructions, redact_secrets  # noqa: E402
 from app.llm import LLMError, OpenRouterChat  # noqa: E402
-from app.mcp_client import HelpdeskMCP  # noqa: E402
+from app.mcp_client import HelpdeskMCP, my_tickets_mcp  # noqa: E402
 from app.schemas import (ApproveRequest, ChatRequest, ChatResponse, Citation, PendingAction,  # noqa: E402
-                         ResetRequest, SessionId, ToolCall)
+                         ResetRequest, SessionId, SessionStartRequest, ToolCall)
+from app.ticket_store import APPROVALS, STATUSES, TicketStore  # noqa: E402
 from app.tickets import ROUTING, TICKET_ID, TicketDraft, TicketDraftError, propose_ticket  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -109,21 +110,36 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.exception("preferences database unavailable: preferences will not be loaded or saved")
         app.state.preferences = None
+    # Permanent ticket record (tickets.db): survives logout, new conversations and restarts. Without it the app
+    # still starts; tickets are still filed through the approval gate, only the history is not recorded.
+    try:
+        app.state.ticket_store = TicketStore()
+    except Exception:
+        log.exception("ticket database unavailable: the ticket history will not be recorded")
+        app.state.ticket_store = None
+    # The employee's permanent ticket history (app/tickets_mcp.py over app/ticket_store.py): get_my_tickets only.
+    # Its own client per lifespan (app.state), so a second lifespan (tests) never stops another one's subprocess.
+    previous_tickets_mcp = getattr(app.state, "tickets_mcp", None)
+    tickets_mcp = my_tickets_mcp()
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
         verify_answers = answer_verification_enabled()
         app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm,
                                       evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"),
-                                      verify_answers=verify_answers)
+                                      verify_answers=verify_answers, tickets=tickets_mcp)
         log.info("answer verification: %s", "on" if verify_answers else "off")
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
                  db_path, expired, retention_days())
         await mcp.start()
+        await tickets_mcp.start()
+        app.state.tickets_mcp = tickets_mcp
         try:
             yield
         finally:
+            await tickets_mcp.stop()
+            app.state.tickets_mcp = previous_tickets_mcp
             await mcp.stop()
             app.state.graph = None
             app.state.checkpointer = None
@@ -396,6 +412,60 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------- POST /api/session/start
+# The Gradio login happens in the UI; without this, the app learns the employee only from the first chat message,
+# so a new conversation's preferences and tickets could not be loaded before it. This does exactly what that first
+# turn does for identity (link the email, issue the session token: same lock, same token, same header and cookie)
+# and nothing else: no message, no agent run. It is STRICTER than the first chat turn: the email must be an ACTIVE
+# employee of the directory. A conversation that already exists is never re-linked and never gets a second token.
+
+SESSION_START_REFUSED = "This conversation already exists, so it cannot be started again. Start a new conversation."
+
+
+@app.post("/api/session/start")
+async def start_session(req: SessionStartRequest, request: Request, response: Response):
+    session = get_session(req.session_id)
+    email = req.user.email
+    try:
+        async with session_turn(session):
+            try:
+                await load_session(req.session_id, session)
+            except Exception:
+                log.exception("session start session=%s: could not load the conversation", session_ref(req.session_id))
+                return JSONResponse(status_code=503, content={"detail": "The conversation could not be checked."})
+            if session["stored"] or session["token_hash"]:
+                # Already started (by this endpoint or by a first chat turn that won the race): no second token, no
+                # re-linking. The same employee holding the current token is told so; anyone else is refused.
+                linked = (session["user"] or {}).get("email")
+                if linked == email and not token_problem(session, presented_token(request, req.session_id)):
+                    return {"session_id": req.session_id, "status": "already_started"}
+                log.warning("session start session=%s refused: the conversation already exists",
+                            session_ref(req.session_id))
+                return JSONResponse(status_code=409, content={"detail": SESSION_START_REFUSED})
+            data, _ = await mcp.call("lookup_employee", {"email": email})
+            record = data.get("employee") if data.get("ok") else None
+            if (not isinstance(record, dict) or str(record.get("email", "")).strip().lower() != email
+                    or record.get("account_status") != "active"):
+                log.warning("session start session=%s refused: not an active employee", session_ref(req.session_id))
+                return JSONResponse(status_code=403,
+                                    content={"detail": "This email is not an active employee in the directory."})
+            token, fields = new_session_token()
+            try:
+                await app.state.graph.aupdate_state(thread_config(req.session_id), {**fields, "user_email": email},
+                                                    as_node=FINAL_NODE)
+                await prune_thread(app.state.checkpointer, req.session_id)
+            except Exception:
+                log.exception("session start session=%s: could not save the conversation", session_ref(req.session_id))
+                return JSONResponse(status_code=503, content={"detail": "The conversation could not be started."})
+            session.update(fields, stored=True)
+            session["user"] = {"email": email}
+            send_session_token(response, req.session_id, token)
+            log.info("session start session=%s user=%s", session_ref(req.session_id), email)
+            return {"session_id": req.session_id, "status": "started"}
+    except SessionBusy:
+        return JSONResponse(status_code=409, content={"detail": "This conversation is busy. Try again in a moment."})
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request, response: Response) -> ChatResponse:
     session = get_session(req.session_id)
@@ -582,6 +652,8 @@ async def _chat(req: ChatRequest, session: dict, response: Response, emit=None,
         citations=[Citation(id=c["id"], title=c.get("title") or "") for c in out.get("citations") or []],
         tool_calls=[ToolCall(**call) for call in out.get("tool_calls", [])] + list(draft_calls),
         usage=out.get("usage") or None,
+        tickets=out.get("tickets") if out.get("outcome") == "tickets" else None,
+        ticket_filter=out.get("ticket_filter") if out.get("outcome") == "tickets" else None,
     )
 
 
@@ -685,6 +757,15 @@ async def _propose_turn_draft(session_id: str, session: dict,
         session["pending_action"] = previous          # never leave an unsaved draft approvable
         raise
     log.info("chat session=%s: ticket draft %s waiting for approval", session_ref(session_id), action.action_id)
+    store = getattr(app.state, "ticket_store", None)
+    if store is not None:                  # the permanent history: pending until Approve or Reject
+        try:
+            if previous is not None and previous.action_id != action.action_id:
+                await asyncio.to_thread(store.discard_pending, previous.action_id)   # replaced, never decided
+            await asyncio.to_thread(store.record_pending, action.action_id, action.payload,
+                                    ROUTING.get(action.payload.get("category")))
+        except Exception:
+            log.exception("chat session=%s: could not record the pending draft", session_ref(session_id))
     return action, calls, None
 
 
@@ -942,6 +1023,19 @@ async def _save_or_log(session_id: str, session: dict) -> None:
         log.exception("approve session=%s: could not save the approval state", session_ref(session_id))
 
 
+async def _record_decision(action_id: str, approval: str, ticket_id: str | None = None, status: str | None = None,
+                           team: str | None = None) -> None:
+    """The employee's decision in the permanent ticket history, once per draft (the store ignores a replay).
+    A failure here never undoes or blocks the decision itself: it is logged."""
+    store = getattr(app.state, "ticket_store", None)
+    if store is None:
+        return
+    try:
+        await asyncio.to_thread(store.decide, action_id, approval, ticket_id, status, team)
+    except Exception:
+        log.exception("could not record the %s decision for %s", approval, action_id)
+
+
 async def _approve(req: ApproveRequest, session: dict, token: str | None) -> ChatResponse:
     # After a restart or an eviction, the draft and the filed record come back from the checkpoint.
     try:
@@ -986,11 +1080,22 @@ async def _approve(req: ApproveRequest, session: dict, token: str | None) -> Cha
     if not req.approved:
         session["pending_action"] = None
         await _save_or_log(req.session_id, session)
+        await _record_decision(pending.action_id, "rejected")
         log.info("approve rejected session=%s action=%s", session_ref(req.session_id), req.action_id)
         return ChatResponse(
             session_id=req.session_id,
             reply="Okay, I did not file the ticket. Tell me if you want to change anything.",
         )
+
+    # Validated once more right before creation: an incomplete or altered payload never reaches create_ticket.
+    try:
+        TicketDraft(**pending.payload)
+    except (ValidationError, TypeError):
+        session["pending_action"] = None
+        await _save_or_log(req.session_id, session)
+        log.warning("approve session=%s action=%s: the payload failed validation, nothing was filed",
+                    session_ref(req.session_id), req.action_id)
+        return ChatResponse(session_id=req.session_id, reply=DRAFT_INVALID_REPLY, state="ticket_failed")
 
     # Exactly the approved payload, with the action id as the idempotency key.
     data, call = await mcp.call("create_ticket", {**pending.payload, "idempotency_key": pending.action_id},
@@ -1002,6 +1107,8 @@ async def _approve(req: ApproveRequest, session: dict, token: str | None) -> Cha
         session["filed"][pending.action_id] = ticket_id
         await _save_or_log(req.session_id, session)
         team = data["ticket"].get("assigned_team") or ROUTING.get(pending.payload["category"], "IT")
+        await _record_decision(pending.action_id, "approved", ticket_id, str(data["ticket"].get("status") or "open"),
+                               team)
         log.info("ticket created session=%s action=%s ticket=%s", session_ref(req.session_id), pending.action_id,
                  ticket_id)
         return ChatResponse(
@@ -1051,12 +1158,17 @@ SESSION_ID_HEADER = "X-Session-Id"
 
 
 async def _preferences_owner(request: Request, session_id: str | None) -> tuple[PreferenceStore, str]:
-    """(store, email) for the employee this session is locked to, or an HTTPException. The target is never
-    chosen by the caller: it is the session's own email, and the session must present its CURRENT token
-    (header or cookie; an expired or unknown one is refused, unlike /reset which accepts an expired one)."""
+    """(store, email) for the employee this session is locked to, or an HTTPException (see _session_email)."""
     store = getattr(app.state, "preferences", None)
     if store is None:
         raise HTTPException(status_code=503, detail="Preferences are not available right now.")
+    return store, await _session_email(request, session_id)
+
+
+async def _session_email(request: Request, session_id: str | None) -> str:
+    """The email this session is locked to, or an HTTPException. The target is never chosen by the caller: it is
+    the session's own email, and the session must present its CURRENT token (header or cookie; an expired or
+    unknown one is refused, unlike /reset which accepts an expired one)."""
     try:
         session_id = _SESSION_ID.validate_python(session_id)
     except ValidationError:
@@ -1067,11 +1179,12 @@ async def _preferences_owner(request: Request, session_id: str | None) -> tuple[
             try:
                 await load_session(session_id, session)
             except Exception:
-                log.exception("preferences session=%s: could not load the saved conversation", session_ref(session_id))
+                log.exception("session check session=%s: could not load the saved conversation",
+                              session_ref(session_id))
                 raise HTTPException(status_code=500, detail="The conversation could not be checked.")
             problem = token_problem(session, presented_token(request, session_id))
             if problem:
-                log.warning("preferences session=%s refused: %s session token", session_ref(session_id), problem)
+                log.warning("session check session=%s refused: %s session token", session_ref(session_id), problem)
                 raise HTTPException(status_code=401 if problem == "missing" else 403,
                                     detail="This request needs this conversation's current session token.")
             email = (session["user"] or {}).get("email")
@@ -1079,7 +1192,27 @@ async def _preferences_owner(request: Request, session_id: str | None) -> tuple[
         raise HTTPException(status_code=409, detail="This conversation is busy. Try again in a moment.")
     if not email:
         raise HTTPException(status_code=404, detail="This conversation is not linked to an employee.")
-    return store, email
+    return email
+
+
+@app.get("/api/my-tickets")
+async def my_tickets(request: Request, response: Response, x_session_id: str | None = Header(default=None),
+                     status: str | None = None, approval: str | None = None) -> dict:
+    """The tickets of the employee this session is locked to, and only theirs (get_my_tickets over MCP). The
+    employee is never chosen by the caller: the same session and current-token check as /preferences."""
+    if (status is not None and status not in STATUSES) or (approval is not None and approval not in APPROVALS):
+        raise HTTPException(status_code=400, detail="Unknown status or approval filter.")
+    email = await _session_email(request, x_session_id)
+    args = {"requester_email": email, **({"status": status} if status else {}),
+            **({"approval": approval} if approval else {})}
+    client = getattr(app.state, "tickets_mcp", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Your tickets are not available right now.")
+    data, _ = await client.call("get_my_tickets", args)
+    if not data.get("ok"):
+        raise HTTPException(status_code=503, detail="Your tickets are not available right now.")
+    response.headers["Cache-Control"] = "no-store"
+    return {"tickets": data.get("tickets") or [], "filter": {"status": status, "approval": approval}}
 
 
 @app.get("/preferences")

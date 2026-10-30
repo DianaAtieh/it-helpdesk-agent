@@ -14,7 +14,7 @@ import pytest
 import app.main as app_main
 from app.agent.preferences import PreferenceStore
 from app.agent.prompts import build_answer_input, build_escalation_input
-from tests.fakes import FakeChat, FakeStreamChat
+from tests.fakes import FakeChat, FakeStreamChat, answer_body
 from tests.test_agent_graph import SARA
 from tests.test_answer_streaming import GOOD, GOOD_REPLY
 from tests.test_ws_chat import (TEXT, TICKET_TEXT, body, chunk_text, converse, env, final_of, sid,  # noqa: F401
@@ -82,7 +82,7 @@ def test_an_explicit_request_is_saved_and_confirmed_with_only_what_was_saved(env
     client, session_id, token, response = start(env, llm_http(), PREF_TEXT)
     assert store().get(SARA) == SAVED
     reply = response.json()["reply"]
-    assert reply.startswith(GOOD_REPLY) and "Saved to your preferences" in reply
+    assert answer_body(reply).startswith(GOOD_REPLY) and "Saved to your preferences" in reply
     assert "numbered" in reply and "short" in reply
     assert prefs(client, session_id, token).json() == {"preferences": SAVED}
 
@@ -116,7 +116,7 @@ def test_a_failed_database_write_is_reported_honestly_and_the_turn_still_answers
     monkeypatch.setattr(store(), "set_many", boom)
     response = chat(client, sid(), PREF_TEXT)
     reply = response.json()["reply"]
-    assert response.status_code == 200 and reply.startswith(GOOD_REPLY)
+    assert response.status_code == 200 and answer_body(reply).startswith(GOOD_REPLY)
     assert "not saved" in reply and "Saved to your preferences" not in reply
     assert store().get(SARA) == {}
 
@@ -438,7 +438,7 @@ def test_websocket_saves_and_confirms_like_http(env):
     events = converse(client, body(sid(), PREF_TEXT))
     final = final_of(events)
     assert store().get(SARA) == SAVED
-    assert final["reply"].startswith(GOOD_REPLY) and "Saved to your preferences" in final["reply"]
+    assert answer_body(final["reply"]).startswith(GOOD_REPLY) and "Saved to your preferences" in final["reply"]
 
 
 def test_websocket_loads_preferences_for_a_new_session(env):

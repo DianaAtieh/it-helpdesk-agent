@@ -17,7 +17,7 @@ from app.agent.graph import build_graph
 from app.agent.nodes import STREAM_ANSWER_KEY, UNGROUNDED_REPLY
 from app.agent.prompts import ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT
 from app.llm import LLMError
-from tests.fakes import FakeChat, FakeKnowledgeBase, FakeStreamChat, evidence, kb_result
+from tests.fakes import FakeChat, FakeKnowledgeBase, FakeStreamChat, answer_body, evidence, kb_result
 from tests.test_escalate_graph import FADI, FIELDS, SARA, ZIAD, DataMCP
 
 KARIM = "karim.saba@nakhla.example"
@@ -58,7 +58,7 @@ def test_a_correct_answer_stays_byte_for_byte_unchanged_and_the_verifier_runs_on
     expected = turn(plain)["reply"]
     graph, llm = make(ANSWER, verdict("supported", "supported"))
     out = turn(graph)
-    assert out["reply"] == expected == GOOD and out["outcome"] == "answered"
+    assert out["reply"] == expected and answer_body(out["reply"]) == GOOD and out["outcome"] == "answered"
     assert verifier_calls(llm) == 1 and [c["id"] for c in out["citations"]] == ["KB-002"]
     assert out["answer_verification"] == {"applied": True, "fallback": False, "checked": 2, "removed": 0,
                                           "groundedness": 0.9, "reason": "applied", "verdicts": {"supported": 2}}
@@ -72,7 +72,7 @@ def test_an_unsupported_sentence_is_removed():
     answer = {**ANSWER, "reply": f"{GOOD} You can also ask a colleague to sync it for you."}
     graph, llm = make(answer, verdict("supported", "supported", "unsupported"))
     out = turn(graph)
-    assert out["reply"] == GOOD and out["outcome"] == "answered" and verifier_calls(llm) == 1
+    assert answer_body(out["reply"]) == GOOD and out["outcome"] == "answered" and verifier_calls(llm) == 1
     assert out["answer_verification"]["removed"] == 1 and [c["id"] for c in out["citations"]] == ["KB-002"]
 
 
@@ -80,7 +80,7 @@ def test_a_wrong_for_employee_sentence_is_removed():
     answer = {**ANSWER, "reply": f"{GOOD} As Finance staff, send VPN problems straight to Security Operations."}
     graph, llm = make(answer, verdict("supported", "supported", "wrong_for_employee"))
     out = turn(graph, email=SARA)                                          # Sara is in Support, not Finance
-    assert out["reply"] == GOOD and "Finance" not in out["reply"] and out["outcome"] == "answered"
+    assert answer_body(out["reply"]) == GOOD and "Finance" not in out["reply"] and out["outcome"] == "answered"
     assert out["answer_verification"]["verdicts"] == {"supported": 2, "wrong_for_employee": 1}
 
 
@@ -102,7 +102,8 @@ def test_low_groundedness_gives_the_fallback():
 def test_a_failed_or_invalid_verdict_keeps_the_code_verified_answer(bad):
     graph, llm = make(ANSWER, bad)
     out = turn(graph)
-    assert out["reply"] == GOOD and out["outcome"] == "answered" and [c["id"] for c in out["citations"]] == ["KB-002"]
+    assert answer_body(out["reply"]) == GOOD
+    assert out["outcome"] == "answered" and [c["id"] for c in out["citations"]] == ["KB-002"]
     assert out["answer_verification"]["applied"] is False and verifier_calls(llm) == 1
     assert next(c for c in out["tool_calls"] if c["tool"] == VERIFY_TOOL)["ok"] is False
 
@@ -172,7 +173,7 @@ def test_off_by_default_makes_no_extra_call_and_changes_nothing():
     llm = FakeChat(ANSWER)
     graph = build_graph(InMemorySaver(), DataMCP(), FakeKnowledgeBase(kb_result(KB002, codes=("NX-112",))), llm)
     out = turn(graph)
-    assert out["reply"] == GOOD and len(llm.calls) == 1 and llm.calls[0]["system"] == SYSTEM_PROMPT
+    assert answer_body(out["reply"]) == GOOD and len(llm.calls) == 1 and llm.calls[0]["system"] == SYSTEM_PROMPT
     assert out["answer_verification"] is None and VERIFY_TOOL not in tools(out)
 
 
@@ -205,8 +206,9 @@ def test_streaming_ends_with_the_verified_answer_not_the_draft():
     shown = "".join(e["text"] for e in events if e["type"] == "chunk")
     finals = [e for e in events if e["type"] == "final"]
     assert extra in shown                                                    # the draft was streamed ...
-    assert len(finals) == 1 and finals[0]["reply"] == GOOD and extra not in finals[0]["reply"]   # ... then replaced
-    assert final["reply"] == GOOD and events[-1]["type"] == "final"
+    assert len(finals) == 1
+    assert answer_body(finals[0]["reply"]) == GOOD and extra not in finals[0]["reply"]   # ... then replaced
+    assert answer_body(final["reply"]) == GOOD and events[-1]["type"] == "final"
     assert sum(c["system"] == VERIFIER_SYSTEM_PROMPT for c in llm.calls) == 1
     assert any(c["system"] == STREAM_SYSTEM_PROMPT for c in llm.stream_calls)
 
@@ -234,7 +236,7 @@ def test_a_citation_that_only_supported_a_dropped_sentence_is_not_shown():
     answer = {**ANSWER, "reply": f"{GOOD} {MFA}", "citations": ["KB-002", "KB-005"]}
     graph, _ = make(answer, verdict("supported", "supported", "unsupported"), kb=TWO_DOCS)
     out = turn(graph)
-    assert out["reply"] == GOOD and out["outcome"] == "answered"
+    assert answer_body(out["reply"]) == GOOD and out["outcome"] == "answered"
     assert [c["id"] for c in out["citations"]] == ["KB-002"]
 
 
@@ -245,7 +247,7 @@ def test_a_citation_that_still_supports_the_answer_stays():
               "citations": ["KB-002", "KB-005"]}
     graph, _ = make(answer, verdict("supported", "unsupported", "supported"), kb=TWO_DOCS)
     out = turn(graph)
-    assert out["reply"] == f"{kept} {MFA}" and [c["id"] for c in out["citations"]] == ["KB-002", "KB-005"]
+    assert answer_body(out["reply"]) == f"{kept} {MFA}" and [c["id"] for c in out["citations"]] == ["KB-002", "KB-005"]
 
 
 def test_losing_every_citation_gives_the_fallback_with_no_citations():

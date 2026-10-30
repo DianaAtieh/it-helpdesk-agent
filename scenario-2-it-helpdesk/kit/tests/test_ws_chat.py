@@ -24,7 +24,7 @@ from app.agent.graph import build_graph
 from app.agent.nodes import POLICY_UNVERIFIED_REPLY
 from app.main import CLAIM_NOTE, app, thread_config
 from app.schemas import ToolCall
-from tests.fakes import FakeKnowledgeBase, FakeStreamChat, kb_result
+from tests.fakes import FakeKnowledgeBase, FakeStreamChat, answer_body, kb_result
 from tests.test_agent_graph import KB002, SARA, STATUS_OK
 from tests.test_answer_streaming import GOOD, GOOD_REPLY
 from tests.test_escalate_graph import FIELDS, DataMCP
@@ -143,13 +143,15 @@ def test_chunks_final_and_numbering_for_a_new_conversation(env):
     final = final_of(events)
     stages = [e["stage"] for e in events if e["type"] == "status"]
     body_events = [e for e in events if e["type"] != "status"]
-    assert kinds(body_events) == ["chunk"] * (len(body_events) - 1) + ["final"] and len(body_events) >= 3
+    # The verified final adds the Sources line and the resolution question, so the streamed draft is retracted.
+    assert kinds(body_events) == ["chunk"] * (len(body_events) - 2) + ["retract", "final"] and len(body_events) >= 3
     assert stages == ["employee", "knowledge_base", "preparing", "generating"]
-    assert kinds(events) == ["status"] * 4 + ["chunk"] * (len(body_events) - 1) + ["final"]   # status is first
+    assert kinds(events) == ["status"] * 4 + ["chunk"] * (len(body_events) - 2) + ["retract", "final"]   # status first
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     assert len({e["turn_id"] for e in events}) == 1
-    assert all(e["provisional"] is True for e in body_events[:-1]) and final["provisional"] is False
-    assert chunk_text(events).strip() == GOOD_REPLY == final["reply"] and final["display"] == "keep"
+    assert all(e["provisional"] is True for e in body_events if e["type"] == "chunk") and final["provisional"] is False
+    assert chunk_text(events).strip() == GOOD_REPLY == answer_body(final["reply"])
+    assert final["display"] == "replace"             # the final adds the Sources line and the resolution question
     assert final["state"] == "answered" and final["session_id"] == session_id
     assert final["citations"] == [{"id": "KB-002", "title": "VPN client versions", "url": None}]
     assert final["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
@@ -180,7 +182,8 @@ def test_the_first_chunk_arrives_while_the_model_is_still_generating(env):
         rest = []
         while not rest or rest[-1]["type"] != "final":
             rest.append(next_event(ws))
-    assert seen["waited_for_client"] and rest[-1]["reply"] == GOOD_REPLY and rest[-1]["display"] == "keep"
+    assert seen["waited_for_client"] and answer_body(rest[-1]["reply"]) == GOOD_REPLY
+    assert rest[-1]["display"] == "replace"          # the final adds the Sources line and the resolution question
 
 
 def test_a_session_token_is_never_logged_or_put_in_a_chunk(env, caplog):
@@ -472,6 +475,6 @@ def test_http_chat_is_unchanged_and_never_streams(env):
     r = client.post("/api/chat", json={"session_id": sid(), "message": TEXT, "user": {"email": SARA}})
     assert r.status_code == 200
     data = r.json()
-    assert data["state"] == "answered" and data["reply"] == "Update NakhlaConnect to 5.4."
+    assert data["state"] == "answered" and answer_body(data["reply"]) == "Update NakhlaConnect to 5.4."
     assert llm.stream_calls == [] and len(llm.calls) == 1 and "X-Session-Token" in r.headers
     assert "provisional" not in data and "type" not in data

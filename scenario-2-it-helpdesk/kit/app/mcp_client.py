@@ -33,6 +33,8 @@ log = logging.getLogger("helpdesk-app.mcp")
 # uses (create_ticket) also needs approved=True, which only /api/approve passes. Any other tool is refused.
 READ_TOOLS = frozenset({"lookup_employee", "get_service_status", "search_tickets"})
 APPROVED_WRITE_TOOLS = frozenset({"create_ticket"})
+# The app's own MCP server for the employee's ticket history (app/tickets_mcp.py): one read tool, no writes.
+MY_TICKETS_TOOLS = frozenset({"get_my_tickets"})
 
 
 def _tool_json(result: Any) -> dict:
@@ -59,20 +61,28 @@ def server_env() -> dict[str, str]:
             **{key: value for key, value in os.environ.items() if key.startswith("HELPDESK_")}}
 
 
+def tickets_server_env() -> dict[str, str]:
+    """The ticket-history server needs only where its database is (TICKETS_DB), nothing else."""
+    return {**get_default_environment(), **({"TICKETS_DB": os.environ["TICKETS_DB"]} if "TICKETS_DB" in os.environ
+                                            else {})}
+
+
 class HelpdeskMCP:
-    def __init__(self) -> None:
+    def __init__(self, module: str = "services.helpdesk_mcp", read_tools: frozenset[str] = READ_TOOLS,
+                 write_tools: frozenset[str] = APPROVED_WRITE_TOOLS, env=server_env) -> None:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
+        self._module, self._read, self._write, self._env = module, read_tools, write_tools, env
 
     async def start(self) -> None:
-        params = StdioServerParameters(command=sys.executable, args=["-m", "services.helpdesk_mcp"],
-                                       cwd=str(KIT), env=server_env())
+        params = StdioServerParameters(command=sys.executable, args=["-m", self._module],
+                                       cwd=str(KIT), env=self._env())
         self._stack = AsyncExitStack()
         read, write = await self._stack.enter_async_context(stdio_client(params))
         self._session = await self._stack.enter_async_context(ClientSession(read, write))
         await self._session.initialize()
         names = sorted(t.name for t in (await self._session.list_tools()).tools)
-        log.info("MCP server started, tools: %s", ", ".join(names))
+        log.info("MCP server %s started, tools: %s", self._module, ", ".join(names))
 
     async def stop(self) -> None:
         if self._stack is not None:
@@ -87,7 +97,7 @@ class HelpdeskMCP:
         never reach the MCP server.
         """
         start = time.perf_counter()
-        if tool not in READ_TOOLS and not (approved and tool in APPROVED_WRITE_TOOLS):
+        if tool not in self._read and not (approved and tool in self._write):
             log.warning("MCP call refused: tool=%s approved=%s", tool, approved)
             data = {"ok": False, "error": {"code": "tool_not_permitted",
                                            "message": "This tool is not permitted from this code path."}}
@@ -104,3 +114,9 @@ class HelpdeskMCP:
         ok = bool(data.get("ok"))
         log.info("tool=%s ok=%s ms=%d", tool, ok, ms)
         return data, ToolCall(tool=tool, ok=ok, ms=ms)
+
+
+def my_tickets_mcp() -> HelpdeskMCP:
+    """The client for app/tickets_mcp.py: get_my_tickets only, never a write."""
+    return HelpdeskMCP("app.tickets_mcp", read_tools=MY_TICKETS_TOOLS, write_tools=frozenset(),
+                       env=tickets_server_env)

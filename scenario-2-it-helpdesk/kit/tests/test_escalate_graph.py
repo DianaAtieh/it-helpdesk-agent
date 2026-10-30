@@ -36,10 +36,13 @@ ZIAD = "ziad.hourani@nakhla.example"         # Contractor
 
 KB002 = evidence("KB-002", "NX-112: device certificate missing. Sync NakhlaManage and restart.",
                  title="VPN error codes and fixes")
-FIELDS = {"subject": "NX-112 on the VPN since this morning",
+FIELDS = {"subject": "NX-112 on the VPN since this morning", "device_type": "laptop", "operating_system": "Windows 11",
           "description": "NakhlaConnect shows NX-112 since this morning. I work from home and cannot work.",
           "category": "network_access", "priority": "P2",
           "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "kb_refs": ["KB-002"], "affected_users": 1}
+# The intake details the ticket contract has no field for, in the description (Sara's location: directory).
+DETAILS = ("\n\nDetails:\n- Error code: NX-112\n- Device: laptop\n- Operating system: Windows 11\n"
+           "- Location: Remote\n- Urgency given: P2")
 ANSWER = {"reply": "Sync NakhlaManage, then restart the laptop.", "citations": ["KB-002"], "needs_clarification": False}
 
 
@@ -90,9 +93,10 @@ def test_an_explicit_request_proposes_a_draft_in_the_state_and_files_nothing():
     graph, mcp, kb, llm = make(FIELDS)
     out = turn(graph, "I did all of that: NakhlaManage Sync and a restart. It still shows NX-112 and I cannot work. "
                       "Please open a ticket.")
-    assert out["outcome"] == "draft_proposed" and out["reply"] == DRAFT_READY_REPLY and out["citations"] == []
+    assert out["outcome"] == "draft_proposed" and out["reply"].startswith(DRAFT_READY_REPLY) and out["citations"] == []
     assert out["draft"] == {"subject": "NX-112 on the VPN since this morning",
-                            "description": FIELDS["description"], "category": "network_access", "priority": "P2",
+                            "description": FIELDS["description"] + DETAILS, "category": "network_access",
+                            "priority": "P2",
                             "requester_email": SARA, "department": "Support",
                             "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "kb_refs": ["KB-002"],
                             "affected_users": 1}
@@ -137,8 +141,8 @@ def test_a_yes_to_the_agents_escalation_offer_proposes_a_draft():
 def test_a_yes_without_an_offer_is_an_ordinary_turn():
     graph, mcp, kb, llm = make(ANSWER, ANSWER)
     turn(graph, "NX-112 since this morning")
-    out = turn(graph, "yes")
-    assert out["draft"] is None and systems(llm) == ["answer", "answer"]
+    out = turn(graph, "yes")       # a yes to the resolution question under the answer: resolved, no ticket, no model
+    assert out["outcome"] == "resolved" and out["draft"] is None and systems(llm) == ["answer"]
 
 
 # ------------------------------------------------------------- ordinary questions and incidents are unchanged
@@ -211,7 +215,7 @@ def test_an_executive_office_draft_is_p1_with_the_identity_notice_and_review_sen
     out = turn(graph, "My monitor flickers. I restarted it. Please open a ticket.", email=SAMIR)
     assert out["draft"]["priority"] == "P1" and out["draft"]["department"] == "Executive Office"
     assert out["draft"]["description"].startswith(IDENTITY_NOTICE)
-    assert out["reply"] == f"{DRAFT_READY_REPLY} {IDENTITY_REVIEW_SENTENCE}"
+    assert out["reply"].startswith(f"{DRAFT_READY_REPLY} {IDENTITY_REVIEW_SENTENCE}")
     assert "verified your identity" not in out["reply"].lower()
 
 

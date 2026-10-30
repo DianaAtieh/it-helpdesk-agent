@@ -14,7 +14,7 @@ import app.main as app_main
 from app.agent.nodes import PREFERENCE_REPLY
 from app.agent.preferences import SAVED_CONFIRMATION, is_preference_claim, strip_preference_claims
 from app.agent.prompts import STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT
-from tests.fakes import FakeChat, FakeStreamChat
+from tests.fakes import FakeChat, FakeStreamChat, answer_body
 from tests.test_agent_graph import SARA
 from tests.test_answer_streaming import GOOD_REPLY
 from tests.test_preferences_integration import chat, start, store
@@ -140,13 +140,13 @@ def test_the_note_for_each_skipped_case_is_decided_by_code(env, monkeypatch):  #
 
 def test_a_normal_answer_is_unchanged_and_gets_no_note(env):  # noqa: F811
     _, _, _, response = start(env, model(GOOD_REPLY))
-    assert response.json()["reply"] == GOOD_REPLY
+    assert answer_body(response.json()["reply"]) == GOOD_REPLY
 
 
 def test_an_informational_remember_is_kept(env):  # noqa: F811
     text = f"Remember to save your work before restarting. {GOOD_REPLY}"
     _, _, _, response = start(env, model(text))
-    assert response.json()["reply"] == text
+    assert answer_body(response.json()["reply"]) == text
 
 
 # ------------------------------------------------------------------ the WebSocket final reply

@@ -93,6 +93,13 @@ class AgentState(TypedDict, total=False):
     # yet a pending action: /api/chat validates and stores it with main.propose_draft; only /api/approve writes.
     # outcome is then "draft_proposed"; a blocked request is "blocked", a missing step or email "clarify".
     draft: dict | None
+    # Mandatory ticket fields collected over turns (app/agent/escalation.py, set by escalate; cleared on a draft, a
+    # block or "resolved"): {"values": {...}, "missing": [...], "asked": <question>, "text": <employee's words>}.
+    ticket_fields: dict | None
+    # A "show me my tickets" turn (route "tickets"): the filters read from the message ({"status", "approval"}) and
+    # the employee's own records from get_my_tickets. Returned to the UI only on that turn (outcome "tickets").
+    ticket_filter: dict | None
+    tickets: list[dict] | None
     # This turn's reply text, and this turn's tool calls as {"tool", "ok", "ms"} dicts.
     # No reducer: each turn overwrites them, so they never carry over from the previous turn.
     reply: str

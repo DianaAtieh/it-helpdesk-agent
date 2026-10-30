@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer
 
 # Size limits keep one request from costing real money (LLM tokens) or memory.
 SessionId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")]
@@ -29,6 +29,12 @@ class ChatRequest(BaseModel):
     session_id: SessionId
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     user: User | None = None          # optional: sample case S2-02 sends no user
+
+
+class SessionStartRequest(BaseModel):
+    """POST /api/session/start: link a brand-new conversation to a signed-in employee before any message."""
+    session_id: SessionId
+    user: User
 
 
 class ApproveRequest(BaseModel):
@@ -72,3 +78,16 @@ class ChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: dict[str, Any] | None = None
+    # Only on a "show me my tickets" turn (state "tickets"): the employee's own ticket records from get_my_tickets,
+    # for the UI to render as cards, and the filters that were applied ({"status", "approval"}).
+    tickets: list[dict[str, Any]] | None = None
+    ticket_filter: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _contract_shape(self, handler):
+        """Every other turn keeps the contract's exact field set: the two ticket-list fields appear only when set."""
+        data = handler(self)
+        if self.tickets is None:
+            data.pop("tickets", None)
+            data.pop("ticket_filter", None)
+        return data

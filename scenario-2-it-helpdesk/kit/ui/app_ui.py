@@ -221,6 +221,8 @@ code { font-family: var(--font-mono); font-size: 0.84em; padding: 1px 6px; borde
 .nk-tile { background: #ffffff; border: 1px solid #e3e8e2; border-radius: 16px; padding: 16px; }
 .nk-tile b { color: #123c32; display: block; margin-bottom: 4px; }
 .nk-tile span { color: #5d6863; font-size: 0.88rem; line-height: 1.5; }
+.nk-ticket-card { border: 1px solid #e3e8e2; border-radius: 14px; padding: 10px 12px; margin: 8px 0;
+                  background: #ffffff; display: grid; gap: 4px; }
 .nk-empty { text-align: center; padding: 34px 16px; color: #75817b; }
 .nk-empty b { display: block; color: #202a27; font-size: 1rem; margin-bottom: 4px; }
 #nk-status-md, #nk-tickets-md { background: #ffffff; border: 1px solid #e3e8e2; border-radius: 18px; padding: 6px 10px; }
@@ -527,10 +529,15 @@ def state_badge(state: str | None) -> str:
 
 
 def side_panels(data: dict) -> tuple[str, str, str]:
-    cites = data.get("citations") or []
+    # Citations are shown INSIDE the answer text (inline and a "Sources:" line). The panel lists only documents the
+    # reply does not already name, so nothing is shown twice; code-issued ones (e.g. KB-016) stay visible.
+    reply = str(data.get("reply") or "")
+    cites = [c for c in data.get("citations") or []
+             if str(c.get("id", "?") if isinstance(c, dict) else c) not in reply]
     cite_md = "### Sources\n" + ("\n".join(
         f"- `{c.get('id', '?')}` {c.get('title', '')}" if isinstance(c, dict) else f"- `{c}`" for c in cites)
-        or "_No knowledge-base article was cited in the last answer._")
+        or ("_Cited inside the answer._" if data.get("citations")
+            else "_No knowledge-base article was cited in the last answer._"))
     calls = data.get("tool_calls") or []
     tools_md = "### Tool calls (last turn)\n" + ("\n".join(
         f"- {'✅' if t.get('ok') else '❌'} `{t.get('tool', '?')}` · {t.get('ms', '?')} ms"
@@ -541,6 +548,8 @@ def side_panels(data: dict) -> tuple[str, str, str]:
     if result:
         result_md += "\n\n" + "\n".join(f"- **{str(k).replace('_', ' ').capitalize()}** `{v}`"
                                         for k, v in result.items())
+    if data.get("tickets") is not None:     # "show me my tickets": the records themselves, as cards
+        result_md += "\n\n" + render_ticket_cards(data.get("tickets"), data.get("ticket_filter"))
     return cite_md, tools_md, result_md
 
 
@@ -679,7 +688,8 @@ PREF_VALUES = {"en": "English", "short": "short", "normal": "normal", "detailed"
                "numbered": "numbered steps", "bullets": "bullet points", "prose": "plain prose"}
 PREF_NOTE = ("_Preferences only change how answers are written, never facts, policies or tickets. "
              "The email you type is not verified: this is a demo without login._")
-PREF_NO_SESSION = "Send a message first, so this conversation is linked to your email."
+PREF_NO_SESSION = "Your conversation is still starting. Try again in a moment."
+PREF_LOADING = "### Saved Preferences\n_Loading your saved preferences..._"
 PREF_ERRORS = {
     401: "This conversation could not be verified. Send a message first.",
     403: "This conversation's session is no longer valid. Start a new chat and try again.",
@@ -804,8 +814,8 @@ def show_page(page: str):
 # The app offers no "list my tickets" endpoint, so this page lists only tickets approved in this browser session,
 # using the ticket ID from the helpdesk's own confirmation and the draft the employee approved. Nothing is invented.
 TICKET_ID = re.compile(r"\b(IT-\d{3,6})\b")
-TICKETS_EMPTY = ("<div class='nk-empty'><b>No tickets filed in this conversation yet</b>When the assistant proposes "
-                 "a ticket, review it in the Ticket approval card and click Approve. Filed tickets appear here.</div>")
+TICKETS_EMPTY = ("<div class='nk-empty'><b>No tickets to show yet</b>When the assistant proposes a ticket, review it "
+                 "in the Ticket approval card and click Approve or Reject. Your tickets appear here.</div>")
 
 
 def render_tickets(tickets: list | None) -> str:
@@ -831,6 +841,90 @@ def record_ticket(history: list, draft: dict | None, tickets: list | None):
         tickets.append({"id": match.group(1), "subject": payload.get("subject") or (draft or {}).get("summary", ""),
                         "priority": payload.get("priority"), "category": payload.get("category")})
     return tickets, render_tickets(tickets)
+
+
+# ---------------------------------------------------------------- My Tickets: the permanent history (server)
+# The app now keeps every ticket the employee approved or rejected (app/ticket_store.py), and GET /api/my-tickets
+# returns only this session's own employee's tickets (get_my_tickets over MCP). They render as cards, both on the
+# My Tickets page and next to the chat when the employee asks "show me my open tickets".
+APPROVAL_BADGES = {"approved": ("Approved", "ok"), "rejected": ("Rejected", "alert"),
+                   "pending": ("Waiting for you", "warn")}
+TICKET_STATUS_BADGES = {"open": ("Open", "info"), "resolved": ("Resolved", "ok"), "closed": ("Closed", "neutral")}
+
+
+def _badge(text: str, kind: str) -> str:
+    return f"<span class='nk-state nk-{kind}'>{html.escape(text)}</span>"
+
+
+def ticket_filter_text(selected: dict | None) -> str:
+    words = [w for w in ((selected or {}).get("approval"), (selected or {}).get("status")) if w]
+    return " ".join([*words, "tickets"])
+
+
+def render_ticket_cards(tickets: list | None, selected: dict | None = None) -> str:
+    """One card per ticket (ID, issue, status, approval, created, updated), each record once. Text is escaped."""
+    seen, cards = set(), []
+    for t in tickets or []:
+        if not isinstance(t, dict) or t.get("action_id") in seen:
+            continue
+        seen.add(t.get("action_id"))
+        approval = APPROVAL_BADGES.get(t.get("approval"), (str(t.get("approval") or ""), "neutral"))
+        status = TICKET_STATUS_BADGES.get(t.get("status"), ("Not filed", "neutral"))
+        ticket_id = html.escape(str(t.get("ticket_id") or "No ticket ID"))
+        issue = html.escape(" ".join(str(t.get("description") or t.get("subject") or "").split())[:220])
+        cards.append(
+            f"<div class='nk-ticket-card' data-approval='{html.escape(str(t.get('approval') or ''))}' "
+            f"data-status='{html.escape(str(t.get('status') or ''))}'>"
+            f"<div><b>{ticket_id}</b> · {html.escape(str(t.get('subject') or ''))}</div>"
+            f"<div>{_badge(*status)} {_badge(*approval)}</div>"
+            f"<div class='nk-muted'>{issue}</div>"
+            f"<div class='nk-muted'>Created {html.escape(str(t.get('created_at') or ''))} · "
+            f"Updated {html.escape(str(t.get('updated_at') or ''))}</div></div>")
+    if not cards:
+        return f"<div class='nk-empty'><b>You don't have any {html.escape(ticket_filter_text(selected))}.</b></div>"
+    return "\n".join(cards)
+
+
+def fetch_my_tickets(session_id: str, auth: dict | None) -> str:
+    """The My Tickets page from GET /api/my-tickets with this tab's session token (issued at sign-in by
+    /api/session/start). Only ever the signed-in employee's own tickets; never a chat turn."""
+    ok, data = call_preferences("GET", "/api/my-tickets", session_id, auth)
+    if ok and isinstance(data, dict):
+        return render_ticket_cards(data.get("tickets"), data.get("filter"))
+    return f"<div class='nk-empty'><b>{html.escape(str(data))}</b></div>"
+
+
+def open_tickets_page(page: str, session_id: str, auth: dict | None):
+    """Opening My Tickets always reloads the signed-in employee's tickets."""
+    return fetch_my_tickets(session_id, auth) if page == NAV_PAGES[2] else gr.skip()
+
+
+def start_session(session_id: str, email: str = "", request: gr.Request | None = None):
+    """On sign-in and on every new chat (a page load): link this tab's NEW conversation to the signed-in employee
+    with POST /api/session/start and keep the session token it issues. Nothing is sent without a signed-in email.
+    If a first chat message got there first, its token is already in auth_state: that is left untouched."""
+    signed_in = login_email(email, request)
+    if not signed_in:
+        return gr.skip()
+    data, issued = call_app("/api/session/start", {"session_id": session_id, "user": {"email": signed_in}})
+    if not issued:
+        ui_log.info("session start: no token issued (%s)", str(data.get("status") or data.get("detail") or "")[:80])
+        return gr.skip()
+    return {"session_id": session_id, "token": issued}
+
+
+def load_preferences_on_start(session_id: str, auth: dict | None):
+    """The saved preferences panel right after the session starts (no message needed)."""
+    ok, data = call_preferences("GET", "/preferences", session_id, auth)
+    if ok and isinstance(data.get("preferences"), dict):
+        return render_preferences(data["preferences"])
+    return gr.skip()
+
+
+def refresh_tickets_page(session_id: str, auth: dict | None):
+    """After a turn or an Approve / Reject: reload the page, only when this tab already holds a session token."""
+    ok, data = call_preferences("GET", "/api/my-tickets", session_id, auth)
+    return render_ticket_cards(data.get("tickets"), data.get("filter")) if ok and isinstance(data, dict) else gr.skip()
 
 
 # ---------------------------------------------------------------- Service Status: the assistant's real answer
@@ -919,7 +1013,7 @@ with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as de
                         with gr.Accordion("Sources", open=True, elem_classes="nk-acc"):
                             cites = gr.Markdown("### Sources\n_No answer yet._", elem_classes="nk-md")
                         with gr.Accordion("Answer preferences", open=False, elem_classes="nk-acc"):
-                            prefs_panel = gr.Markdown(render_preferences({}))
+                            prefs_panel = gr.Markdown(PREF_LOADING)
                             with gr.Row():
                                 prefs_refresh_btn = gr.Button("Refresh Preferences", size="sm")
                                 prefs_clear_btn = gr.Button("Clear Saved Preferences", variant="stop", size="sm")
@@ -936,10 +1030,11 @@ with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as de
                 status_btn = gr.Button("Ask the assistant for the current status", variant="primary")
 
             with gr.Column(visible=False) as page_tickets:
-                gr.HTML(PAGE_HEAD.format(title="My Tickets", text="Tickets you approved in this conversation, with the "
-                                         "ID the helpdesk confirmed. The helpdesk offers no full ticket list to "
-                                         "this app."), padding=False)
+                gr.HTML(PAGE_HEAD.format(title="My Tickets", text="Every ticket you approved or rejected, saved "
+                                         "permanently: it stays after you log out or start a new chat. Only "
+                                         "your own tickets are shown."), padding=False)
                 tickets_md = gr.Markdown(TICKETS_EMPTY, elem_id="nk-tickets-md", padding=True)
+                tickets_btn = gr.Button("Load my tickets", variant="primary")
 
             with gr.Column(visible=False) as page_help:
                 gr.HTML(PAGE_HEAD.format(title="Help Center", text="How the Nakhla assistant works and how to reach "
@@ -954,8 +1049,12 @@ with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as de
               [prefs_panel, prefs_feedback, prefs_seen])
     turn.then(update_status_page, [result, chat], status_md)
     approve_btn.click(lambda h, s, p, a: decide(True, h, s, p, a), [chat, session, pending_state, auth_state],
-                      outputs).then(record_ticket, [chat, last_draft, tickets_state], [tickets_state, tickets_md])
-    reject_btn.click(lambda h, s, p, a: decide(False, h, s, p, a), [chat, session, pending_state, auth_state], outputs)
+                      outputs).then(record_ticket, [chat, last_draft, tickets_state], [tickets_state, tickets_md]
+                                    ).then(refresh_tickets_page, [session, auth_state], tickets_md)
+    reject_btn.click(lambda h, s, p, a: decide(False, h, s, p, a), [chat, session, pending_state, auth_state], outputs
+                     ).then(refresh_tickets_page, [session, auth_state], tickets_md)
+    turn.then(refresh_tickets_page, [session, auth_state], tickets_md)
+    tickets_btn.click(fetch_my_tickets, [session, auth_state], tickets_md)
     pending_state.change(lambda p: p if p else gr.skip(), pending_state, last_draft)
     prefs_refresh_btn.click(refresh_preferences, [session, auth_state], [prefs_panel, prefs_feedback])
     prefs_clear_btn.click(clear_preferences, [session, auth_state], [prefs_panel, prefs_feedback])
@@ -963,11 +1062,17 @@ with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as de
     for button in suggest_btns:
         button.click(lambda text=button.value: text, None, msg)
     nav.change(show_page, nav, pages)
+    nav.change(open_tickets_page, [nav, session, auth_state], tickets_md)
     status_btn.click(lambda: (STATUS_QUESTION, NAV_PAGES[0]), None, [msg, nav])
     help_chat_btn.click(lambda: NAV_PAGES[0], None, nav)
     new_btn.click(None, None, None, js=NEW_CHAT)
     demo.load(signed_in_text, None, signed_in)
     demo.load(profile_card, None, profile)
+    # Sign-in and every new chat (a page load): start the conversation for the signed-in employee, then show their
+    # saved preferences and tickets without waiting for a first message.
+    started = demo.load(start_session, [session, email], auth_state)
+    started.then(load_preferences_on_start, [session, auth_state], prefs_panel)
+    started.then(refresh_tickets_page, [session, auth_state], tickets_md)
 
 if __name__ == "__main__":
     import users                      # ui/users.py: the demo login accounts (python ui/users.py add-all)

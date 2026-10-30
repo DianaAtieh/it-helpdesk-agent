@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.agent.graph import build_graph
 from app.agent.nodes import STREAM_ANSWER_KEY
 from app.agent.streaming import NODE_STATUS, STATUS_LABELS, status_event
-from tests.fakes import FakeKnowledgeBase, FakeStreamChat, kb_result
+from tests.fakes import FakeKnowledgeBase, FakeStreamChat, answer_body, kb_result
 from tests.test_agent_graph import FakeMCP, SARA
 from tests.test_answer_streaming import GOOD, GOOD_REPLY, KB002, TEXT, run_turn
 
@@ -45,7 +45,7 @@ def test_labels_are_fixed_generic_text_only():
 def test_status_text_never_reaches_the_final_state():
     events, final = run_turn(FakeStreamChat(GOOD), with_status=True)
     reply = final["messages"][-1].content
-    assert reply == GOOD_REPLY
+    assert answer_body(reply) == GOOD_REPLY
     for label in STATUS_LABELS.values():
         assert label not in reply
 

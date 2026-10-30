@@ -70,7 +70,7 @@ def test_the_yes_to_an_offer_rule_is_unchanged():
 def test_the_failed_ui_cases_now_prepare_a_draft_and_never_create_a_ticket(text):
     graph, mcp, kb, llm = make(FIELDS)
     out = turn(graph, text)
-    assert out["outcome"] == "draft_proposed" and out["reply"] == DRAFT_READY_REPLY and out["draft"]
+    assert out["outcome"] == "draft_proposed" and out["reply"].startswith(DRAFT_READY_REPLY) and out["draft"]
     assert systems(llm) == ["escalate"]                                      # no answer call: no "I can't" reply
     assert "create_ticket" not in mcp.calls and set(mcp.calls) <= {"lookup_employee", "get_service_status",
                                                                   "search_tickets"}

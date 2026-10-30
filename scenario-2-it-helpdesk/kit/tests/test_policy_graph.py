@@ -21,7 +21,7 @@ from app.agent.prompts import ESCALATION_SYSTEM_PROMPT, SYSTEM_PROMPT
 from app.schemas import ToolCall
 from ingestion.chunking import chunk_document
 from ingestion.loaders import load_knowledge_base
-from tests.fakes import FakeChat, FakeKnowledgeBase, kb_result
+from tests.fakes import FakeChat, FakeKnowledgeBase, answer_body, kb_result
 
 DATA = Path(__file__).resolve().parent.parent / "services" / "data"
 DIRECTORY = {e["email"]: e for e in json.loads((DATA / "employees.json").read_text(encoding="utf-8"))["employees"]}
@@ -128,7 +128,8 @@ def test_a_ticket_for_an_assisted_password_reset_is_still_drafted():
     fields = {"subject": "Assisted password reset: no NakhlaKey and no backup codes",
               "description": "I lost my phone and have no backup codes, so self-service reset is impossible.",
               "category": "identity_access", "priority": "P3", "affected_users": 1, "kb_refs": [],
-              "attempted_steps": ["Tried the self-service reset: no NakhlaKey device and no backup codes"]}
+              "attempted_steps": ["Tried the self-service reset: no NakhlaKey device and no backup codes"],
+              "device_type": "phone", "operating_system": "Windows 11"}
     graph, kb, llm = make(fields, records=real("KB-004", "SP-001"))
     out = turn(graph, "I have no NakhlaKey and no backup codes. Please reset my password for me, open a ticket.")
     assert out["outcome"] == "draft_proposed" and out["draft"]["category"] == "identity_access"
@@ -185,7 +186,8 @@ def test_forbidden_advice_from_the_model_is_replaced_by_the_whole_refusal(reply,
 def test_a_model_warning_against_a_bypass_is_kept():
     graph, kb, llm = make({"reply": S2_03_REPLY, "citations": ["KB-002", "SP-002"]}, codes=("NX-781",))
     out = turn(graph, S2_03_ASK, email=TARIQ)
-    assert out["outcome"] == "answered" and out["reply"] == S2_03_REPLY        # the real S2-03 answer, intact
+    assert out["outcome"] == "answered"
+    assert answer_body(out["reply"]) == S2_03_REPLY        # the real S2-03 answer, intact
     assert [c["id"] for c in out["citations"]] == ["KB-002", "SP-002"]
 
 
@@ -197,7 +199,8 @@ def test_an_unsupported_fact_from_the_model_is_removed():
     graph, kb, llm = make({"reply": reply, "citations": ["KB-002"]}, codes=("NX-781",))
     out = turn(graph, "NX-781 on my VPN")
     assert out["outcome"] == "answered"
-    assert out["reply"] == "Update to version 5.4.2 from Software Center. The minimum is 5.4 since 2026-06-01."
+    assert answer_body(out["reply"]) == ("Update to version 5.4.2 from Software Center. "
+                                         "The minimum is 5.4 since 2026-06-01.")
 
 
 def test_a_mostly_unsupported_answer_becomes_the_honest_fallback():
@@ -211,7 +214,7 @@ def test_a_made_up_document_reference_is_removed():
     reply = "Update to version 5.4.2 from Software Center. KB-018 describes a faster way."
     graph, kb, llm = make({"reply": reply, "citations": ["KB-002"]}, codes=("NX-781",))
     out = turn(graph, "NX-781 on my VPN")
-    assert out["reply"] == "Update to version 5.4.2 from Software Center."
+    assert answer_body(out["reply"]) == "Update to version 5.4.2 from Software Center."
 
 
 # ------------------------------------------------------------- diagnostics: counts only, never content
@@ -288,7 +291,8 @@ def test_an_incident_turn_is_unchanged():
 def test_a_ticket_draft_is_unchanged_and_not_run_through_the_verifier():
     fields = {"subject": "NX-112 on the VPN since this morning", "description": "NakhlaConnect shows NX-112.",
               "category": "network_access", "priority": "P2", "kb_refs": ["KB-002"], "affected_users": 1,
-              "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"]}
+              "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "device_type": "laptop",
+              "operating_system": "Windows 11"}
     graph, kb, llm = make(fields, codes=("NX-112",))
     out = turn(graph, "It still shows NX-112 after a sync and a restart. I cannot work. Please open a ticket.")
     assert out["outcome"] == "draft_proposed" and out["draft"]["priority"] == "P2"
@@ -321,7 +325,7 @@ def test_a_weakened_lockout_threshold_is_removed_and_logged_as_a_count(caplog):
     graph, kb, llm = make({"reply": f"{P08_KEPT} {P08_WEAKENED}", "citations": ["KB-006", "SP-001"]},
                           records=real("KB-004", "KB-006", "SP-001"), codes=("NID-423",))
     out = turn(graph, "NakhlaID says NID-423 when I try to sign in. What should I do?")
-    assert (out["outcome"], out["reply"]) == ("answered", P08_KEPT)
+    assert (out["outcome"], answer_body(out["reply"])) == ("answered", P08_KEPT)
     assert [c["id"] for c in out["citations"]] == ["KB-006", "SP-001"]
     assert agent_logs(caplog) == ["verifier: checked=4 unsupported=1 removed_sentences=1 citations_dropped=0 "
                                   "fallback=False"]

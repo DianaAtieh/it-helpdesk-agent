@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Annotated, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from app.tickets import IDENTITY_SUMMARY_FLAG, apply_priority_rules  # noqa: F401  (the flag is re-exported)
 
@@ -110,13 +112,48 @@ def last_messages(messages: list) -> tuple[str, str | None]:
     return latest, previous
 
 
-def is_ticket_request(latest: str, previous_assistant: str | None = None) -> bool:
-    """True only for an explicit ticket request, or a clear yes to the agent's own offer to escalate."""
+def explicit_ticket_request(latest: str) -> bool:
     latest = latest or ""
-    if (any(not _INFORMATIONAL.search(latest[:m.start()]) for m in _TICKET_REQUEST.finditer(latest))
-            and not _NEGATED_REQUEST.search(latest)):
+    return (any(not _INFORMATIONAL.search(latest[:m.start()]) for m in _TICKET_REQUEST.finditer(latest))
+            and not _NEGATED_REQUEST.search(latest))
+
+
+def is_ticket_request(latest: str, previous_assistant: str | None = None) -> bool:
+    """True only for an explicit ticket request, or a clear yes to the agent's own offer to escalate. A bare yes to
+    the resolution question ("Did this resolve your issue, or ...?") answers its first half: resolved, no ticket.
+    An offer the answer itself made ("I can escalate it to IT as a ticket") still turns a yes into a request."""
+    if explicit_ticket_request(latest):
         return True
-    return bool(previous_assistant and _ESCALATION_OFFER.search(previous_assistant) and _CLEAR_YES.match(latest))
+    return bool(previous_assistant and _ESCALATION_OFFER.search(answer_body(previous_assistant))
+                and _CLEAR_YES.match(latest or ""))
+
+
+# ---------------------------------------------------------------- after an answer: resolved, or a ticket?
+
+# Added by respond under every verified answer; the employee's reply to it decides what happens next.
+RESOLUTION_QUESTION = "Did this resolve your issue, or would you like me to open a support ticket?"
+RESOLVED_REPLY = ("I'm glad that's resolved. I haven't opened a ticket. If the problem comes back, just tell me, "
+                  "or say \"open a ticket\".")
+
+
+def answer_body(previous_assistant: str) -> str:
+    """The previous reply without the resolution question respond appended to it."""
+    return (previous_assistant or "").replace(RESOLUTION_QUESTION, "")
+
+
+_RESOLVED = re.compile(r"(?i)\b(?:resolved|fixed|solved|sorted|works?|worked|working)\b")
+_NOT_RESOLVED = re.compile(r"(?i)\b(?:not|never|still|again)\b|n't\b|^\s*no\b(?!\s+need\b)")
+
+
+def reports_resolved(messages: list) -> bool:
+    """True if the employee answers the resolution question by saying the issue is resolved (or a bare yes).
+    An explicit ticket request, or any negation ("still not working"), is never "resolved"."""
+    latest, previous = last_messages(messages)
+    if not previous or RESOLUTION_QUESTION not in previous or explicit_ticket_request(latest):
+        return False
+    if _CLEAR_YES.match(latest or ""):          # a yes to the answer's own escalation offer is a ticket request
+        return not _ESCALATION_OFFER.search(answer_body(previous))
+    return bool(_RESOLVED.search(latest or "")) and not _NOT_RESOLVED.search(latest or "")
 
 
 def answers_finance_vpn_reply(messages: list) -> bool:
@@ -132,11 +169,243 @@ def continues_ticket_request(previous_assistant: str | None) -> bool:
     return bool(previous_assistant) and previous_assistant.strip() == ASK_STEPS_REPLY
 
 
-def wants_ticket(messages: list) -> bool:
+def wants_ticket(messages: list, state: dict | None = None) -> bool:
     """The routing decision after retrieval: an explicit request, a clear yes to an offer, or an answer to the
-    agent's question for attempted steps. Decided in code from the conversation; never by the model."""
+    agent's question for missing ticket fields. Decided in code from the conversation; never by the model."""
     latest, previous = last_messages(messages)
-    return is_ticket_request(latest, previous) or continues_ticket_request(previous)
+    return (is_ticket_request(latest, previous) or continues_ticket_request(previous)
+            or (state is not None and collecting(state)))
+
+
+# ---------------------------------------------------------------- mandatory ticket fields, collected over turns
+#
+# TicketIntake is the structured, strict schema of what a ticket needs to know about the PROBLEM. It reuses the ticket
+# contract's names (dataset/schemas/ticket.schema.json: subject, description, priority, affected_users,
+# attempted_steps) and adds what that contract has no field for (device, operating system, location, error code,
+# device name). The helpdesk API accepts no extra properties, so those go into the ticket's description as a
+# "Details" block (intake_to_fields). Who the employee is (email, name, employee ID, department) is never part of
+# it: build_draft takes that from the directory record.
+#
+# The collected values live in state["ticket_fields"] = {"values": {...}, "missing": [...], "asked": <question>,
+# "text": <the employee's words for this ticket>}, saved by the checkpointer, so a later answer adds to them.
+# Whether a field is missing is decided HERE, by Pydantic (TicketIntake.model_validate), never by the model.
+
+DEVICE_TYPES = ("laptop", "desktop", "phone", "tablet", "printer", "monitor", "dock", "other")
+URGENCIES = MODEL_PRIORITIES                  # P2 | P3 | P4 from the employee's answer; P1 only ever from a rule
+
+
+class TicketIntake(BaseModel):
+    """What the ticket must know about the problem. Required fields are mandatory; None means not given yet."""
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    subject: str = Field(min_length=5, max_length=SUBJECT_MAX)              # the issue title
+    description: str = Field(min_length=10, max_length=DESCRIPTION_MAX)     # the problem, in the employee's words
+    device_type: Literal[DEVICE_TYPES]
+    operating_system: str = Field(min_length=2, max_length=60)
+    location: str = Field(min_length=2, max_length=60)                      # an office, or remote
+    affected_users: int = Field(default=1, ge=1, le=1000)   # optional: only when the employee says so (never asked)
+    priority: Literal[URGENCIES]                                            # the urgency
+    attempted_steps: list[Annotated[str, Field(min_length=3, max_length=STEP_MAX)]] = Field(
+        min_length=1, max_length=STEPS_MAX)
+    error_code: str | None = Field(default=None, max_length=20)             # optional
+    device_name: str | None = Field(default=None, max_length=80)            # optional (hostname)
+
+    @field_validator("affected_users", mode="before")
+    @classmethod
+    def _no_bool(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("a number of people")
+        return value
+
+
+MANDATORY_FIELDS = tuple(name for name, f in TicketIntake.model_fields.items() if f.is_required())
+_ADAPTERS = {name: TypeAdapter(Annotated[f.annotation, *f.metadata] if f.metadata else f.annotation)
+             for name, f in TicketIntake.model_fields.items()}
+# What to ask for each field the employee must give. The subject is written from the description, never asked.
+ASK_FOR = {
+    "description": "what exactly is happening (the problem and any error message you see)",
+    "device_type": "which device it is on (laptop, desktop, phone, tablet, printer, ...)",
+    "operating_system": "which operating system the device runs (Windows, macOS, Linux, ...)",
+    "location": "where you are working from (which office, or remote)",
+    "priority": ("how urgent it is: completely blocked with no workaround, a workaround exists, or a request or "
+                 "question"),
+    "attempted_steps": "what you have already tried to fix it",
+}
+EMPLOYEE_FIELDS = tuple(ASK_FOR)
+ASK_DESCRIPTION_REPLY = ("Before I prepare the ticket: what exactly is happening? Please describe the problem and "
+                         "any error message you see.")
+_FIELD_WORDS = {
+    "description": re.compile(r"(?i)\b(?:happen\w*|describe|problem|issue|error|symptoms?|going\s+on|wrong)\b"),
+    "device_type": re.compile(r"(?i)\b(?:device|laptop|desktop|computer|phone|tablet|printer)\b"),
+    "operating_system": re.compile(r"(?i)\b(?:operating\s+system|os|windows|macos|linux)\b"),
+    "location": re.compile(r"(?i)\b(?:where|location|office|remote|home)\b"),
+    "affected_users": re.compile(r"(?i)\b(?:how\s+many|people|colleagues|anyone\s+else|others|affected)\b"),
+    "priority": re.compile(r"(?i)\b(?:urgent|urgency|blocked|workaround|priority)\b"),
+    "attempted_steps": re.compile(r"(?i)\b(?:tried|try|steps?|attempted|done\s+so\s+far)\b"),
+}
+# Words that carry no description of a problem: a bare "please open a ticket" describes nothing.
+_FILLER = frozenset("""
+    a an the i me my we you your it this that is are am be can could would will please pls hi hello hey thanks
+    thank ok okay yes yeah sure need want help for to of and with just now so do something issue problem ticket
+    support it's i'm can't
+""".split())
+
+
+def ask_reply(missing: list[str]) -> str:
+    """The fixed question for exactly the missing fields."""
+    if missing == ["attempted_steps"]:
+        return ASK_STEPS_REPLY
+    if missing == ["description"]:
+        return ASK_DESCRIPTION_REPLY
+    asks = [ASK_FOR[f] for f in missing if f in ASK_FOR]
+    if len(asks) == 1:
+        return f"Before I prepare the ticket, please tell me {asks[0]}."
+    return "Before I prepare the ticket, please tell me:\n" + "\n".join(f"- {a}" for a in asks)
+
+
+# Kept for callers and tests that ask for the two original fields together.
+ASK_BOTH_REPLY = ask_reply(["description", "attempted_steps"])
+
+
+def collecting(state: dict) -> bool:
+    """True if the agent's previous reply was its own question for missing ticket fields: this message answers it."""
+    fields = state.get("ticket_fields")
+    if not isinstance(fields, dict) or not fields.get("missing") or not fields.get("asked"):
+        return False
+    _, previous = last_messages(state.get("messages") or [])
+    return bool(previous) and previous.strip() == str(fields["asked"]).strip()
+
+
+def collection_text(state: dict) -> str:
+    """The employee's words about the problem this ticket is for. Continuing a collection: everything they said for
+    it so far plus this answer. Otherwise the request plus the employee's previous message, because the problem is
+    usually described one turn before the request ("NX-112 ..." -> answer -> "open a ticket")."""
+    messages = state.get("messages") or []
+    latest, previous = last_messages(messages)
+    if collecting(state):
+        return f"{state['ticket_fields'].get('text') or ''}\n{latest}".strip()
+    if previous:
+        employee = [str(m.content) for m in messages if isinstance(m, HumanMessage)]
+        if len(employee) >= 2:
+            return f"{employee[-2]}\n{latest}".strip()
+    return latest
+
+
+_ANY_CODE = re.compile(r"(?i)(?<![a-z0-9])[a-z]{2,5}[-\s]?\d{2,5}(?![a-z0-9])")
+
+
+def describes_problem(text: str) -> bool:
+    """An error code ("nx-781" is a description on its own), or at least two meaningful words once the ticket
+    request itself is removed (never a bare "open a ticket")."""
+    rest = _TICKET_REQUEST.sub(" ", text or "")
+    if _ANY_CODE.search(rest):
+        return True
+    words = re.findall(r"[a-z0-9][a-z0-9'-]*", rest.lower())
+    return len([w for w in words if w not in _FILLER]) >= 2
+
+
+def _valid(name: str, value):
+    """The value if it is valid for that one field, else None (so a bad value is never stored)."""
+    if value in (None, "", []) or isinstance(value, bool):
+        return None
+    try:
+        return _ADAPTERS[name].validate_python(value)
+    except ValidationError:
+        return None
+
+
+def merge_fields(previous: dict | None, proposed) -> dict:
+    """The collected values after this turn: earlier values are kept, valid new ones are added, steps accumulate.
+    Nothing is invented here; the model saw the earlier values, so it may extend them (never blank them)."""
+    values = dict(previous or {})
+    proposed = dict(proposed) if isinstance(proposed, dict) else {}
+    if proposed.get("priority") == "P1":            # P1 only ever comes from a rule: a model's P1 is capped at P2
+        proposed["priority"] = "P2"
+    for name in TicketIntake.model_fields:
+        if name == "attempted_steps":
+            continue
+        value = _valid(name, proposed.get(name))
+        if value is not None:
+            values[name] = value
+    values["attempted_steps"] = list(dict.fromkeys([*_steps(values.get("attempted_steps")),
+                                                    *_steps(proposed.get("attempted_steps"))]))[:STEPS_MAX]
+    for key in ("category", "kb_refs"):                # code still checks both in build_draft
+        if proposed.get(key) not in (None, "", []):
+            values[key] = proposed[key]
+    return values
+
+
+def is_finance_vpn(state: dict, text: str) -> bool:
+    employee = state.get("employee") if isinstance(state.get("employee"), dict) else {}
+    return employee.get("department") == FINANCE and (is_vpn_topic(text, list(state.get("codes") or []))
+                                                      or answers_finance_vpn_reply(state.get("messages") or []))
+
+
+def prefill(values: dict, state: dict, request_text: str) -> dict:
+    """What code already knows, so the employee is never asked for it: the location of the directory record (the
+    employee may still give another), the error code from the message, the Finance VPN step, and a subject written
+    from the description. The operating system is always asked: the device with the problem may not be the one the
+    directory lists."""
+    values = dict(values)
+    employee = state.get("employee") if isinstance(state.get("employee"), dict) else {}
+    if not values.get("location") and _valid("location", employee.get("location")):
+        values["location"] = _valid("location", employee.get("location"))
+    codes = list(state.get("codes") or [])
+    if not values.get("error_code") and codes:
+        values["error_code"] = codes[0]
+    if not values.get("attempted_steps") and is_finance_vpn(state, request_text):
+        values["attempted_steps"] = [FINANCE_VPN_STEP]
+    if not values.get("subject") and values.get("description"):
+        values["subject"] = _text(f"{values['description']}", SUBJECT_MAX)
+    return values
+
+
+def missing_fields(values: dict, state: dict, text: str, request_text: str | None = None) -> list[str]:
+    """The mandatory fields still missing or invalid, by Pydantic validation of the whole intake. A description
+    counts only when the employee's own words (text) describe a problem."""
+    missing: set[str] = set()
+    try:
+        TicketIntake.model_validate(values)
+    except ValidationError as exc:
+        missing = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
+    if not describes_problem(text):
+        missing.add("description")
+    if "subject" in missing and "description" not in missing:
+        missing.discard("subject")                     # written from the description by prefill, never asked
+    return [name for name in MANDATORY_FIELDS if name in missing]
+
+
+def validated_intake(values: dict, state: dict, text: str, request_text: str | None = None) -> TicketIntake | None:
+    """The complete intake, or None while anything mandatory is missing. The only way to a draft."""
+    if missing_fields(values, state, text, request_text):
+        return None
+    return TicketIntake.model_validate(values)
+
+
+def missing_question(proposed: str | None, missing: list[str]) -> str:
+    """The model's question if it asks for exactly the missing fields (and nothing already given), else a fixed one."""
+    question = " ".join(proposed.split())[:400] if isinstance(proposed, str) else ""
+    if (question.endswith("?") and not re.search(r"https?://|\d", question)
+            and all(_FIELD_WORDS[f].search(question) for f in missing if f in _FIELD_WORDS)
+            and not any(_FIELD_WORDS[f].search(question) for f in EMPLOYEE_FIELDS if f not in missing)
+            and not _FIELD_WORDS["affected_users"].search(question)):        # never asked
+        return question
+    return ask_reply(missing)
+
+
+def intake_to_fields(intake: TicketIntake, proposed: dict) -> dict:
+    """The ticket contract's fields from a complete intake: the details the contract has no field for go into the
+    description, in a fixed "Details" block. category and kb_refs are the model's suggestions (build_draft checks)."""
+    device = intake.device_type + (f" ({intake.device_name})" if intake.device_name else "")
+    details = [f"- Device: {device}", f"- Operating system: {intake.operating_system}",
+               f"- Location: {intake.location}", f"- Urgency given: {intake.priority}"]
+    if intake.error_code:
+        details.insert(0, f"- Error code: {intake.error_code}")
+    proposed = proposed if isinstance(proposed, dict) else {}
+    return {"subject": intake.subject, "description": f"{intake.description}\n\nDetails:\n" + "\n".join(details),
+            "category": proposed.get("category"), "priority": intake.priority,
+            "attempted_steps": list(intake.attempted_steps), "affected_users": intake.affected_users,
+            "kb_refs": proposed.get("kb_refs") or []}
 
 
 # ---------------------------------------------------------------- the reply when a draft is prepared
@@ -149,11 +418,44 @@ ESCALATION_FAILED_REPLY = ("Sorry, I couldn't prepare the ticket draft right now
                            "Please try again in a moment.")
 
 
-def draft_reply(draft: dict, employee: dict | None) -> str:
-    """The fixed reply for a prepared draft (never the model's text). It claims nothing about identity."""
+APPROVAL_REQUEST = "Do you approve this ticket? Click Approve to file it, or Reject to cancel."
+
+
+def draft_summary(draft: dict, employee: dict | None = None, intake=None) -> str:
+    """The draft's fields as the employee will see them in the approval card (code-built, from the validated draft
+    and intake). The employee lines come from the directory record, never from the model."""
+    description = str(draft.get("description") or "")
+    if description.startswith(IDENTITY_NOTICE):
+        description = description[len(IDENTITY_NOTICE):].strip()
+    if intake is not None:
+        description = intake.description
+    employee = employee if isinstance(employee, dict) else {}
+    who = " · ".join(str(v) for v in (employee.get("name"), employee.get("employee_id"), draft.get("requester_email"))
+                     if v)
+    lines = [f"- Employee: {who}"] if who else []
+    lines += [f"- Subject: {draft.get('subject', '')}",
+              f"- Description: {' '.join(description.split())[:300]}"]
+    if intake is not None:
+        device = intake.device_type + (f" ({intake.device_name})" if intake.device_name else "")
+        lines += [f"- Error code: {intake.error_code or 'none given'}", f"- Device: {device}",
+                  f"- Operating system: {intake.operating_system}", f"- Location: {intake.location}",
+                  f"- People affected: {intake.affected_users}"]
+    lines += [f"- Category: {draft.get('category', '')}",
+              f"- Priority: {draft.get('priority', '')}",
+              f"- Department: {draft.get('department', '')}",
+              f"- Steps already tried: {'; '.join(draft.get('attempted_steps') or [])}"]
+    if draft.get("kb_refs"):
+        lines.append(f"- Related articles: {', '.join(draft['kb_refs'])}")
+    return "Ticket summary:\n" + "\n".join(lines)
+
+
+def draft_reply(draft: dict, employee: dict | None, intake=None) -> str:
+    """The fixed reply for a prepared draft (never the model's text): the summary and the request for explicit
+    approval. It claims nothing about identity."""
+    head = DRAFT_READY_REPLY
     if requires_identity_review(employee):
-        return f"{DRAFT_READY_REPLY} {IDENTITY_REVIEW_SENTENCE}"
-    return DRAFT_READY_REPLY
+        head = f"{DRAFT_READY_REPLY} {IDENTITY_REVIEW_SENTENCE}"
+    return f"{head}\n\n{draft_summary(draft, employee, intake)}\n\n{APPROVAL_REQUEST}"
 
 
 # ---------------------------------------------------------------- topic helpers

@@ -26,7 +26,7 @@ SARA = {"email": "sara.mikhail@nakhla.example"}          # Support
 SAMIR = {"email": "samir.nassar@nakhla.example"}         # Executive Office (VIP)
 KB002 = evidence("KB-002", "NX-112: device certificate missing. Sync NakhlaManage and restart.",
                  title="VPN error codes and fixes")
-FIELDS = {"subject": "NX-112 on the VPN since this morning",
+FIELDS = {"subject": "NX-112 on the VPN since this morning", "device_type": "laptop", "operating_system": "Windows 11",
           "description": "NakhlaConnect shows NX-112 since this morning. I work from home and cannot work.",
           "category": "network_access", "priority": "P2",
           "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "kb_refs": ["KB-002"], "affected_users": 1}
@@ -81,7 +81,7 @@ def saved(client, session_id: str) -> dict:
 def test_a_ticket_request_returns_a_pending_draft_and_files_nothing(client, agent):
     agent(FIELDS)
     out = chat(client, "s-1", REQUEST)
-    assert out["state"] == "await_approval" and out["reply"] == DRAFT_READY_REPLY and out["result"] is None
+    assert out["state"] == "await_approval" and out["reply"].startswith(DRAFT_READY_REPLY) and out["result"] is None
     pending = out["pending_action"]
     assert pending["type"] == "create_ticket" and pending["action_id"].startswith("act-")
     assert pending["payload"]["requester_email"] == SARA["email"] and pending["payload"]["department"] == "Support"

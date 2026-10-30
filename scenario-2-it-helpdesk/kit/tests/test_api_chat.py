@@ -172,7 +172,7 @@ def test_the_graph_cannot_write_tickets(client):
         source = path.read_text(encoding="utf-8")
         assert "create_ticket" not in source and "add_ticket_note" not in source, path.name
     assert list(app.state.graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "escalate",
-                                                       "respond", "__end__"]
+                                                       "respond", "my_tickets", "__end__"]
 
 
 def test_a_policy_refusal_keeps_the_contract_shape_with_its_code_issued_citation(client):

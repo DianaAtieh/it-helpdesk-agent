@@ -87,3 +87,16 @@ class FakeKnowledgeBase:
 
 __all__ = ["FakeChat", "FakeKnowledgeBase", "FakeStreamChat", "KnowledgeBaseError", "LLMError", "evidence",
            "kb_result"]
+
+
+def answer_body(reply) -> str:
+    """The verified answer without what respond adds to every answered reply: the per-claim citations it puts in
+    front of a sentence the model left uncited ("According to KB-002, update ..." -> "Update ..."), the "Sources:"
+    line and the resolution question. Identity on every other reply. (Test answers never say "According to".)"""
+    import re
+
+    from app.agent.escalation import RESOLUTION_QUESTION
+    text = str(reply or "")
+    text = re.sub(r"\n\nSources: [^\n]*\n\n" + re.escape(RESOLUTION_QUESTION) + r"$", "", text)
+    return re.sub(r"According to (?:KB|SP)-\d{3}(?:(?:, | and )(?:KB|SP)-\d{3})*, (\S)",
+                  lambda m: m.group(1).upper(), text)

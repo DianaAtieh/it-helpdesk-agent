@@ -46,6 +46,20 @@ def preferences_db(tmp_path_factory):
         os.environ["PREFERENCES_DB"] = previous
 
 
+@pytest.fixture(scope="session", autouse=True)
+def tickets_db(tmp_path_factory):
+    """A throw-away ticket history (app/ticket_store.py), so no test ever creates or writes app/data/tickets.db.
+    The app's ticket-history MCP server is a subprocess: it gets the same path through TICKETS_DB."""
+    path = tmp_path_factory.mktemp("tickets") / "tickets.db"
+    previous = os.environ.get("TICKETS_DB")
+    os.environ["TICKETS_DB"] = str(path)
+    yield path
+    if previous is None:
+        os.environ.pop("TICKETS_DB", None)
+    else:
+        os.environ["TICKETS_DB"] = previous
+
+
 @pytest.fixture(scope="session")
 def client(checkpoint_db):
     with TestClient(app) as c:          # starts the app's lifespan once: checkpointer + MCP server

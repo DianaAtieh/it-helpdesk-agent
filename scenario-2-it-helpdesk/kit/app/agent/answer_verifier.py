@@ -255,3 +255,78 @@ async def verify_with_llm(llm: ChatModel | None, reply: str, *, evidence: list[d
     return AIVerification(reply=fallback_reply if fallback else kept, applied=True, fallback=fallback,
                           checked=len(sentences), removed=removed, verdicts=counts, groundedness=grounded,
                           reason="applied", usage=dict(out.usage), citations=[] if fallback else kept_citations)
+
+
+# ---------------------------------------------------------------- inline citations, claim by claim
+
+_PIECES = re.compile(r"(?<=[.!?])(\s+)")
+_LEAD = re.compile(r"^(\s*(?:[-*•]\s+|\d+[.)]\s+)?(?:\*\*)?)")       # a list marker or bold opener stays in front
+# "Restart the laptop (KB-002)." written by the model: the same citation, said as "According to KB-002, ...".
+_TRAILING_REF = re.compile(r"^(.*?)\s*\(((?:KB|SP)-\d{3}(?:\s*(?:,|and)\s*(?:KB|SP)-\d{3})*)\)([.!]?)$")
+# Sentence openers that are ordinary words, lower-cased after "According to KB-002, ". Names (NakhlaConnect,
+# Software Center, Finance) keep their capital.
+_COMMON_OPENERS = frozenset("""
+    a an the this that these those it its your you if when after before then to for do don't never always please
+    open update restart install check use select go sign approve enter make contact try run reset choose click
+    connect reconnect wait ask report keep follow remove turn set switch log there here in on at from with
+    older newer new only all every each sync download delete enable disable verify confirm call visit send see
+    note save close start stop plug unplug move change add request reinstall uninstall upgrade
+""".split())
+
+
+_CONTINUES = re.compile(r"(?i)^(?:then|next|after\s+that|afterwards|finally|also|and)\b")
+
+
+def according_to(docs: list[str], sentence: str) -> str:
+    """'According to KB-002, update ...' (several documents: 'According to KB-002 and SP-002, ...')."""
+    names = docs[0] if len(docs) == 1 else f"{', '.join(docs[:-1])} and {docs[-1]}"
+    first, _, rest = sentence.partition(" ")
+    if first.lower().strip(",") in _COMMON_OPENERS and first[:1].isupper() and first[1:2].islower():
+        sentence = first[:1].lower() + first[1:] + (" " + rest if rest else "")
+    return f"According to {names}, {sentence}"
+
+
+def attribute_sentences(reply: str, citations: list[dict], evidence: list[dict]) -> str:
+    """Name the source at the start of each claim the model left without one, as "According to KB-002, ...": when
+    that cited document's evidence holds the sentence's concrete facts (the code verifier's fact matching), with all
+    such documents together. A sentence with no concrete fact is attributed only when exactly one document is cited.
+    A citation the model wrote as "(KB-002)" at the end of a sentence is said the same way. Nothing is forced: an
+    unsupported sentence, a question or a fragment stays as it is."""
+    texts: dict[str, list[str]] = {}
+    for record in evidence or []:
+        if isinstance(record, dict):
+            texts.setdefault(str(record.get("doc_id", "")), []).append(str(record.get("text", "")))
+    sources = {c["id"]: _Haystack(texts[c["id"]]) for c in citations or []
+               if isinstance(c, dict) and c.get("id") in texts}
+    if not sources:
+        return reply
+    lines = []
+    for line in (reply or "").split("\n"):
+        parts = _PIECES.split(line)                     # sentences at even positions, the spaces between at odd ones
+        previous: list[str] = []                        # the source(s) of the sentence before, in this line
+        for index in range(0, len(parts), 2):
+            sentence = parts[index]
+            stripped = sentence.rstrip()
+            lead = _LEAD.match(stripped).group(1)
+            core, tail = stripped[len(lead):], sentence[len(stripped):]
+            trailing = _TRAILING_REF.match(core)
+            if trailing and not _DOC_REF.search(_clean(trailing.group(1))) and len(trailing.group(1).split()) >= 2:
+                docs = _DOC_REF.findall(trailing.group(2))
+                parts[index] = f"{lead}{according_to(docs, trailing.group(1) + trailing.group(3))}{tail}"
+                previous = docs
+                continue
+            if _DOC_REF.search(_clean(core)):
+                previous = _DOC_REF.findall(_clean(core))
+                continue
+            if len(core.split()) < 3 or core.endswith("?"):
+                continue
+            facts = facts_in(core)
+            docs = [d for d, haystack in sources.items() if any(haystack.supports(f) for f in facts)]
+            if not facts and len(sources) == 1:
+                # "Then restart it." right after a sentence from the same document continues that claim: no repeat.
+                docs = [] if _CONTINUES.match(core) and previous == list(sources) else list(sources)
+            if docs:
+                parts[index] = f"{lead}{according_to(docs, core)}{tail}"
+                previous = docs
+        lines.append("".join(parts))
+    return "\n".join(lines)

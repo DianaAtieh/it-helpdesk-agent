@@ -20,7 +20,7 @@ from app.agent.nodes import (LLM_FAILED_REPLY, STREAM_ANSWER_KEY, UNGROUNDED_REP
 from app.agent.prompts import STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT
 from app.agent.streaming import AnswerStreamParser, reconcile
 from app.llm import LLMError, OpenRouterChat
-from tests.fakes import FakeChat, FakeKnowledgeBase, FakeStreamChat, evidence, kb_result
+from tests.fakes import FakeChat, FakeKnowledgeBase, FakeStreamChat, answer_body, evidence, kb_result
 from tests.test_agent_graph import FakeMCP, SARA
 from tests.test_escalate_graph import DataMCP
 
@@ -249,9 +249,11 @@ def test_streamed_turn_emits_chunks_then_the_verified_final_and_calls_no_json_mo
     assert kinds(events) == ["chunk"] * len(chunks(events)) + ["final"] and len(chunks(events)) >= 2
     assert [e["seq"] for e in events[:-1]] == list(range(1, len(events)))
     assert all(e["provisional"] for e in events[:-1]) and events[-1]["provisional"] is False
-    assert events[-1]["reply"] == final["reply"] == GOOD_REPLY and final["outcome"] == "answered"
+    assert events[-1]["reply"] == final["reply"] and answer_body(final["reply"]) == GOOD_REPLY
+    assert final["outcome"] == "answered"
     assert events[-1]["citations"] == [{"id": "KB-002", "title": "VPN client versions"}]
-    assert reconcile(chunks(events), False, events[-1]["reply"]) == "keep"
+    # The verified final adds the Sources line and the resolution question, so the client swaps in the final text.
+    assert reconcile(chunks(events), False, events[-1]["reply"]) == "replace"
     assert len(llm.stream_calls) == 1 and llm.calls == []
     assert llm.stream_calls[0]["system"] == STREAM_SYSTEM_PROMPT
     assert final["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
@@ -308,7 +310,7 @@ def test_ticket_claim_in_the_stream_is_retracted_and_stripped_by_respond():
                           "\nCITATIONS: KB-002"])
     events, final = run_turn(llm)
     assert "retract" in kinds(events) and "created a ticket" not in " ".join(chunks(events))
-    assert "created a ticket" not in final["reply"] and final["reply"].startswith("Update NakhlaConnect")
+    assert "created a ticket" not in final["reply"] and answer_body(final["reply"]).startswith("Update NakhlaConnect")
 
 
 def test_text_the_chunk_check_cannot_judge_is_replaced_by_the_verifier():
@@ -357,7 +359,7 @@ def test_broken_envelope_falls_back_to_one_normal_json_call_without_chunks():
     events, final = run_turn(llm)
     assert chunks(events) == [] and kinds(events) == ["final"]
     assert len(llm.stream_calls) == 1 and len(llm.calls) == 1
-    assert final["outcome"] == "answered" and final["reply"] == "Update NakhlaConnect to 5.4."
+    assert final["outcome"] == "answered" and answer_body(final["reply"]) == "Update NakhlaConnect to 5.4."
 
 
 def test_cancelled_turn_closes_the_model_stream():

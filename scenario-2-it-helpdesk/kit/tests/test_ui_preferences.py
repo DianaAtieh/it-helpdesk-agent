@@ -91,7 +91,7 @@ def test_refresh_shows_an_empty_list_when_nothing_is_saved(http):
 def test_without_a_token_for_this_session_nothing_is_sent(http, action, auth):
     fake = http(data={"preferences": SAVED})
     panel, feedback = action(SID, auth)
-    assert fake.calls == [] and "Send a message first" in feedback
+    assert fake.calls == [] and ui.PREF_NO_SESSION in feedback
     assert "cleared" not in feedback.replace("NOT cleared", "")
     assert TOKEN not in feedback
 

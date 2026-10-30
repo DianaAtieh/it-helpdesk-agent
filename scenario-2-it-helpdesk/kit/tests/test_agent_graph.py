@@ -24,7 +24,8 @@ from app.agent.nodes import (KB_TOOL, LLM_FAILED_REPLY, TICKET_ID_REMOVED, UNGRO
 from app.llm import LLMError
 from app.main import DEFAULT_CHECKPOINT_DB
 from app.schemas import ToolCall
-from tests.fakes import FakeChat, FakeKnowledgeBase, KnowledgeBaseError, evidence, kb_result
+from tests.fakes import (FakeChat, FakeKnowledgeBase, KnowledgeBaseError, answer_body, evidence,
+                         kb_result)
 
 INC_2207 = {"id": "INC-2207", "status": "active", "priority": "P1", "service": "vpn",
             "title": "VPN gateway GW-2 degraded", "error_codes": ["NX-503"],
@@ -93,7 +94,7 @@ def tool_names(out: dict) -> list[str]:
 def test_the_graph_has_the_phase_2_and_4_nodes_and_ends_at_respond():
     graph, *_ = make()
     assert list(graph.get_graph().nodes) == ["__start__", "triage", "retrieve", "answer", "escalate", "respond",
-                                             "__end__"]
+                                             "my_tickets", "__end__"]
     assert FINAL_NODE == "respond"
 
 
@@ -148,7 +149,7 @@ def test_an_anonymous_vague_message_is_asked_for_details_not_given_the_incident_
 def test_an_answer_keeps_valid_citations_usage_and_the_tool_calls_in_order():
     graph, *_ = make()
     out = turn(graph, "NakhlaConnect shows NX-781", SARA)
-    assert out["outcome"] == "answered" and out["reply"] == GOOD["reply"]
+    assert out["outcome"] == "answered" and answer_body(out["reply"]) == GOOD["reply"]
     assert out["citations"] == [{"id": "KB-002", "title": "VPN client versions"}]
     assert out["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
     assert tool_names(out) == ["lookup_employee", "get_service_status", KB_TOOL]
@@ -179,7 +180,7 @@ def test_secrets_ticket_ids_and_ticket_claims_never_leave_the_agent():
     graph, *_ = make(llm=llm)
     out = turn(graph, "NX-781")
     assert "Hunter2-secret" not in out["reply"] and "IT-2001" not in out["reply"]
-    assert "created a ticket" not in out["reply"] and "Update to 5.4." in out["reply"]
+    assert "created a ticket" not in out["reply"] and "Update to 5.4." in answer_body(out["reply"])
 
 
 def test_an_injected_document_cannot_make_the_agent_leak_or_claim_a_ticket():
@@ -392,7 +393,8 @@ def test_a_fabricated_action_from_the_model_never_reaches_the_employee():
                     "citations": ["KB-002"]})
     graph, *_ = make(llm=llm)
     out = turn(graph, "NX-781")
-    assert out["reply"] == "Update to 5.4." and out["citations"] == [{"id": "KB-002", "title": "VPN client versions"}]
+    assert answer_body(out["reply"]) == "Update to 5.4."
+    assert out["citations"] == [{"id": "KB-002", "title": "VPN client versions"}]
 
 
 def test_an_unsafe_clarification_never_reaches_the_employee_through_the_graph():

@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_config, get_stream_writer
 
 from app import timing  # noqa: E402
-from app.agent import access, answer_verifier, escalation, policy
+from app.agent import access, answer_verifier, escalation, my_tickets, policy
 from app.agent.codes import classify_codes, is_ambiguous, without_codes
 from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
@@ -59,7 +59,9 @@ def describe_status(data: dict) -> str:
 
 # ---------------------------------------------------------------- triage (Phase 2): no LLM
 
-EMPLOYEE_FIELDS = ("email", "department", "vip", "contractor")
+# The profile fields the ticket intake reads (escalation.prefill, draft_summary): name and employee ID for the
+# summary, the device OS and location so the employee is not asked for them. The model prompts pick their own.
+EMPLOYEE_FIELDS = ("email", "department", "vip", "contractor", "name", "employee_id", "location", "device_os")
 INCIDENT_FIELDS = ("id", "title", "service", "priority", "error_codes", "workaround", "instructions")
 
 # Loose forms ("nx 503", "NX503", "nx-503") are accepted ONLY to match a code an active incident lists, so a
@@ -300,7 +302,13 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
         if matched and restricted:
             matched = None
         topics = [] if matched or policy_hit else status_question(text, state.get("messages") or [])
-        wants_ticket = escalation.wants_ticket(state.get("messages") or [])
+        wants_ticket = escalation.wants_ticket(state.get("messages") or [], state)
+        # "Show me my open tickets": the employee's own ticket list (my_tickets node, get_my_tickets over MCP).
+        show_tickets = not matched and not policy_hit and my_tickets.is_request(text)
+        wants_ticket = wants_ticket and not show_tickets
+        # "It's fixed" in answer to the resolution question under the last answer: end there, no ticket, no model.
+        resolved = (not matched and not policy_hit and not wants_ticket
+                    and escalation.reports_resolved(state.get("messages") or []))
         # No actual error code can be told from a comparison: ask which one, rather than treat every code as active.
         # Ticket requests, policy refusals and department rules keep their own flows.
         clarify_code = ambiguous and not matched and not restricted and not wants_ticket
@@ -319,8 +327,9 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
             "active_incident": matched,
             "services": status_services(data) if status_checked and topics else [],
             "status_topics": topics,
-            "route": ("incident" if matched else "clarify" if clarify_code else "status" if topics
-                      else "preference" if preference_only else "retrieve"),
+            "route": ("incident" if matched else "tickets" if show_tickets else "resolved" if resolved
+                      else "clarify" if clarify_code
+                      else "status" if topics else "preference" if preference_only else "retrieve"),
             "tool_calls": calls,
         }
 
@@ -330,8 +339,9 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
 def route_after_triage(state: AgentState) -> str:
     """The conditional edge after triage: "incident", "status" (a service status question), "preference" (a message
     that only states a persistent preference), "clarify" (several codes, none clearly the employee's own) or
-    "retrieve"."""
-    return state.get("route") if state.get("route") in ("incident", "status", "preference", "clarify") else "retrieve"
+    "retrieve"; "resolved" (the employee says the last answer fixed it: no ticket)."""
+    routes = ("incident", "status", "preference", "clarify", "resolved", "tickets")
+    return state.get("route") if state.get("route") in routes else "retrieve"
 
 
 def code_clarify_reply(state: AgentState) -> str:
@@ -752,7 +762,7 @@ def add_usage(first: dict | None, second: dict | None) -> dict:
 def route_after_retrieve(state: AgentState) -> str:
     """The conditional edge after retrieve: "escalate" for a ticket request (decided in code from the
     conversation, see escalation.wants_ticket), otherwise "answer"."""
-    return "escalate" if escalation.wants_ticket(state.get("messages") or []) else "answer"
+    return "escalate" if escalation.wants_ticket(state.get("messages") or [], state) else "answer"
 
 
 def make_escalate(llm: ChatModel | None, mcp: MCPClient | None = None) -> Callable[[AgentState], Awaitable[dict]]:
@@ -793,27 +803,45 @@ def make_escalate(llm: ChatModel | None, mcp: MCPClient | None = None) -> Callab
             calls.append(call.model_dump())
             checked = bool(data.get("ok"))
             signals = escalation.history_signals(data.get("tickets")) if checked else []
+        # The mandatory fields collected so far, only when this message answers the agent's question for them.
+        continuing = escalation.collecting(state)
+        collected = dict((state.get("ticket_fields") or {}).get("values") or {}) if continuing else {}
+        ticket_text = escalation.collection_text(state)
         # Codes mentioned only for comparison never make a duplicate: compare on the employee's own codes.
-        dup_text = escalation.duplicate_text(state.get("messages") or [])
+        dup_text = ticket_text if continuing else escalation.duplicate_text(state.get("messages") or [])
         dup_split = classify_codes(dup_text)
         dup_codes = [c for c in state.get("codes") or [] if c not in dup_split.not_actual]
         duplicate = checked and escalation.open_duplicate(signals, without_codes(dup_text, dup_split.not_actual),
                                                           dup_codes)
         log.info("memory: open_tickets=%d history_checked=%s duplicate=%s", len(signals), checked, duplicate)
-        memory = {"open_ticket_signals": signals, "history_checked": checked, "tool_calls": calls}
+        memory = {"open_ticket_signals": signals, "history_checked": checked, "tool_calls": calls,
+                  "ticket_fields": None}
         if duplicate:
             return {**result(escalation.DUPLICATE_REPLY, "blocked"), **memory}
 
         if llm is None:
             return {**result(escalation.ESCALATION_FAILED_REPLY, "error"), **memory}
         try:
-            out = await llm.complete_json(ESCALATION_SYSTEM_PROMPT, build_escalation_input(state, text))
+            out = await llm.complete_json(ESCALATION_SYSTEM_PROMPT, build_escalation_input(state, text, collected))
         except LLMError:
             return {**result(escalation.ESCALATION_FAILED_REPLY, "error"), **memory}
-        outcome = escalation.build_draft(out.data, state, text)
+        # Mandatory fields are enforced HERE, in code: no draft while one is missing; the model only phrases the
+        # question, and only a question for exactly the missing fields is used (else a fixed one).
+        # The draft rules (Finance VPN, "completely blocked") read the request as before; across a collection, every
+        # answer the employee gave for this ticket.
+        request_text = ticket_text if continuing else text
+        values = escalation.prefill(escalation.merge_fields(collected, out.data), state, request_text)
+        intake = escalation.validated_intake(values, state, ticket_text, request_text)   # Pydantic, in code
+        if intake is None:
+            missing = escalation.missing_fields(values, state, ticket_text, request_text)
+            proposed = out.data.get("missing_question") if isinstance(out.data, dict) else None
+            question = escalation.missing_question(proposed, missing)
+            fields = {"values": values, "missing": missing, "asked": question, "text": ticket_text}
+            return {**result(question, "clarify", usage=out.usage), **memory, "ticket_fields": fields}
+        outcome = escalation.build_draft(escalation.intake_to_fields(intake, values), state, request_text)
         if outcome.kind == "draft":
-            return {**result(escalation.draft_reply(outcome.draft, state.get("employee")), "draft_proposed",
-                             outcome.draft, out.usage), **memory}
+            reply = escalation.draft_reply(outcome.draft, state.get("employee"), intake)
+            return {**result(reply, "draft_proposed", outcome.draft, out.usage), **memory}
         if outcome.kind == "ask_steps":
             return {**result(outcome.reply, "clarify", usage=out.usage), **memory}
         return {**result(outcome.reply, "blocked", usage=out.usage), **memory}
@@ -979,6 +1007,11 @@ def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState]
             reply, outcome, citations, usage = preference_reply(state), "preference", [], {}
         elif state.get("route") == "clarify":
             reply, outcome, citations, usage = code_clarify_reply(state), "clarify", [], {}
+        elif state.get("route") == "resolved":
+            reply, outcome, citations, usage = escalation.RESOLVED_REPLY, "resolved", [], {}
+        elif state.get("route") == "tickets":         # code-written line; the records go to the UI as data
+            reply = state.get("reply") or my_tickets.UNAVAILABLE_REPLY
+            outcome, citations, usage = my_tickets.OUTCOME, [], {}
         else:
             titles: dict[str, str] = {}
             for record in state.get("evidence") or []:
@@ -1036,6 +1069,13 @@ def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState]
                 policy_citations = valid_finance_vpn_citations(state.get("policy_citations"))
             if outcome == "draft_proposed" and isinstance(state.get("draft"), dict):
                 draft = dict(state["draft"])
+        if outcome == "answered":                           # after every check: sources, then the next step
+            ids = [c["id"] for c in citations]
+            # Each claim carries its own source in the text: the model's inline citations as written, and code adds
+            # one only where that document's evidence supports the sentence (never a blanket prefix, never forced).
+            body = answer_verifier.attribute_sentences(reply.rstrip(), citations, list(state.get("evidence") or []))
+            tail = f"\n\nSources: {', '.join(ids)}\n\n{escalation.RESOLUTION_QUESTION}"
+            reply = body[:MAX_REPLY_CHARS - len(tail)].rstrip() + tail   # the cap never cuts the tail
         reply = safe_reply(reply)
         # The response shows model/evidence citations and, on a refusal, the code-issued SP citation; the state
         # keeps the code-issued ones apart (policy_citations), so they are never mistaken for the model's.
@@ -1046,6 +1086,8 @@ def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState]
         out = {"reply": reply, "messages": [AIMessage(content=reply)], "citations": shown,
                "policy_citations": policy_citations, "outcome": outcome, "usage": usage, "draft": draft,
                "answer_verification": verification}
+        if outcome == "resolved":                   # the conversation's ticket collection, if any, ends here
+            out["ticket_fields"] = None
         if verification is not None:                # only a verified turn changes this turn's tool calls
             out["tool_calls"] = tool_calls
         return out
