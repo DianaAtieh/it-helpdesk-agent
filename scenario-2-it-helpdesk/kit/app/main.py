@@ -77,6 +77,12 @@ def checkpoint_db_path() -> Path:
     return path if path.is_absolute() else KIT / path
 
 
+def answer_verification_enabled() -> bool:
+    """ANSWER_VERIFICATION, read when the app starts: the AI verifier of final answers (app/agent/answer_verifier.py)
+    is ON unless it is set to 0 / false / no / off. Unset or empty means on."""
+    return (os.getenv("ANSWER_VERIFICATION") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # The SQLite checkpointer (conversation memory for the LangGraph agent) and the MCP server both live
@@ -106,8 +112,11 @@ async def lifespan(app: FastAPI):
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         await checkpointer.setup()
         app.state.checkpointer = checkpointer
+        verify_answers = answer_verification_enabled()
         app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm,
-                                      evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"))
+                                      evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"),
+                                      verify_answers=verify_answers)
+        log.info("answer verification: %s", "on" if verify_answers else "off")
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",
                  db_path, expired, retention_days())
