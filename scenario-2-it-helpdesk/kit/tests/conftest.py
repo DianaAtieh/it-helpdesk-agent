@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+os.environ.setdefault("TRIAGE_LLM", "false")      # tests of the real app stay offline; tests/test_triage_llm.py fakes it
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient

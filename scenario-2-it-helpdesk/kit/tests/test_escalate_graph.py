@@ -16,7 +16,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app.agent.escalation import (ASK_EMAIL_REPLY, ASK_STEPS_REPLY, CONTRACTOR_VPN_REPLY, DRAFT_READY_REPLY,
+from app.agent.escalation import (ASK_EMAIL_REPLY, ASK_STEPS_REPLY, STEPS_NOT_PROVIDED, CONTRACTOR_VPN_REPLY, DRAFT_READY_REPLY,
                                   ESCALATION_FAILED_REPLY, IDENTITY_NOTICE, IDENTITY_REVIEW_SENTENCE,
                                   NO_EMPLOYEE_REPLY)
 from app.agent.graph import build_graph
@@ -41,7 +41,7 @@ FIELDS = {"subject": "NX-112 on the VPN since this morning", "device_type": "lap
           "category": "network_access", "priority": "P2",
           "attempted_steps": ["NakhlaManage Sync", "Restarted the laptop"], "kb_refs": ["KB-002"], "affected_users": 1}
 # The intake details the ticket contract has no field for, in the description (Sara's location: directory).
-DETAILS = ("\n\nDetails:\n- Error code: NX-112\n- Device: laptop\n- Operating system: Windows 11\n"
+DETAILS = ("\n\nDetails:\n- Error code: NX-112\n- Operating system: Windows 11 24H2 (from directory)\n"
            "- Location: Remote\n- Urgency given: P2")
 ANSWER = {"reply": "Sync NakhlaManage, then restart the laptop.", "citations": ["KB-002"], "needs_clarification": False}
 
@@ -197,15 +197,18 @@ def test_a_contractor_vpn_request_gets_the_vdi_route_and_no_draft():
 
 # ------------------------------------------------------------- missing attempted steps
 
-def test_missing_steps_ask_once_and_the_answer_continues_the_ticket():
-    no_steps = dict(FIELDS, attempted_steps=[])
-    graph, mcp, kb, llm = make(no_steps, FIELDS)
-    first = turn(graph, "NX-112 on my VPN. Please open a ticket.")
-    assert (first["outcome"], first["reply"], first["draft"]) == ("clarify", ASK_STEPS_REPLY, None)
-    second = turn(graph, "I did a NakhlaManage Sync and restarted the laptop.")      # no word "ticket"
-    assert second["outcome"] == "draft_proposed"
-    assert second["draft"]["attempted_steps"] == ["NakhlaManage Sync", "Restarted the laptop"]
-    assert systems(llm) == ["escalate", "escalate"]
+def test_steps_the_employee_never_mentioned_are_not_recorded():
+    copied = dict(FIELDS, attempted_steps=["Reinstalled the certificate bundle"])     # from the evidence, not the employee
+    graph, mcp, kb, llm = make(copied)
+    out = turn(graph, "NX-112 keeps dropping my VPN connection. Please open a ticket.")
+    assert out["outcome"] == "draft_proposed"
+    assert out["draft"]["attempted_steps"] == [STEPS_NOT_PROVIDED] and "create_ticket" not in mcp.calls
+
+
+def test_steps_in_the_employee_s_own_words_are_kept():
+    graph, mcp, kb, llm = make(FIELDS)
+    out = turn(graph, "NX-112 on my VPN. I did a NakhlaManage Sync and restarted the laptop. Please open a ticket.")
+    assert out["draft"]["attempted_steps"] == ["NakhlaManage Sync", "Restarted the laptop"]
 
 
 # ------------------------------------------------------------- directory rules through the graph

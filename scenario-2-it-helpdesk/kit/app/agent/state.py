@@ -96,6 +96,9 @@ class AgentState(TypedDict, total=False):
     # Mandatory ticket fields collected over turns (app/agent/escalation.py, set by escalate; cleared on a draft, a
     # block or "resolved"): {"values": {...}, "missing": [...], "asked": <question>, "text": <employee's words>}.
     ticket_fields: dict | None
+    # What this turn is about, set by triage on every turn and read by the routing and answer steps, so they cannot
+    # disagree: {"intent", "wants_ticket", "no_error_code", "source": "llm" | "patterns"}. Never any employee text.
+    triage_result: dict | None
     # A "show me my tickets" turn (route "tickets"): the filters read from the message ({"status", "approval"}) and
     # the employee's own records from get_my_tickets. Returned to the UI only on that turn (outcome "tickets").
     ticket_filter: dict | None

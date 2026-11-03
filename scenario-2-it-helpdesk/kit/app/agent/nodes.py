@@ -10,16 +10,18 @@ import logging
 import re
 import time
 from contextlib import aclosing
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.config import get_config, get_stream_writer
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app import timing  # noqa: E402
 from app.agent import access, answer_verifier, escalation, my_tickets, policy
 from app.agent.codes import classify_codes, is_ambiguous, without_codes
 from app.agent.preferences import is_preference_only, strip_preference_claims
-from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, build_answer_input,
+from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT,
+                               build_triage_input, build_answer_input,
                                build_escalation_input)
 from app.agent.streaming import AnswerStreamParser, chunk_event, final_event, retract_event, status_event
 from app.agent.retrieval import KnowledgeBase, KnowledgeBaseError, strict_codes
@@ -250,12 +252,55 @@ def match_incident(incidents: list[dict], text: str, codes: list[str], exclude=f
     return None
 
 
-def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
+# The employee said there is no error code: the same check when the model cannot answer.
+_NO_ERROR_CODE = re.compile(
+    r"(?i)\b(?:no|without|not\s+any)\s+(?:an?\s+)?(?:error\s+)?code\b"
+    r"|\b(?:don't|do\s+not|doesn't|does\s+not|didn't|did\s+not)\s+(?:have|see|show|get|give)\s+(?:an?\s+|any\s+)?"
+    r"(?:error\s+)?code\b")
+# A new question while the agent waits for ticket details: never an answer to it, whatever the model says.
+_NEW_QUESTION = re.compile(r"(?i)^\s*(?:which|who|whom|whose|where|when|why|how|is|are|am|do|does|did|can|could|will|"
+                           r"should|what(?!\s+i\b))\b|\?\s*$")
+TRIAGE_TOOL = "triage_llm"          # how the triage model appears in the response's tool_calls
+TRIAGE_TIMEOUT_S = 8.0              # after this the pattern rules decide: routing never waits long for the model
+INTENTS = ("it_question", "ticket", "details", "my_tickets", "status", "resolved", "preference", "unclear")
+# The model's "ticket" counts only if the message itself asks for one, or for people to handle it. A model is too ready
+# to call any request it cannot fulfil a ticket, and a wrong draft is worse than a normal answer.
+_ASKS_FOR_PEOPLE = re.compile(r"\bIT\b|(?i:\b(?:tickets?|helpdesk|help\s+desk|service\s+desk|support|technician|"
+                              r"someone|somebody|escalate|raise|report|log\s+this|file\s+this|submit)\b)")
+
+
+class TriageIntent(BaseModel):
+    """What the triage model may say. Anything else in its answer is ignored; an invalid value is no answer at all."""
+    model_config = ConfigDict(extra="ignore")
+
+    intent: Literal[INTENTS]
+    no_error_code: bool = False
+
+
+async def classify_intent(llm: ChatModel, state: AgentState, text: str) -> tuple[TriageIntent | None, dict]:
+    """The model's validated reading of the message and its tool_calls entry; None if it failed or returned anything
+    invalid, so the pattern rules decide. The model has no tools, and nothing it says reaches the employee."""
+    start = time.perf_counter()
+    decided = None
+    try:
+        out = await asyncio.wait_for(llm.complete_json(TRIAGE_SYSTEM_PROMPT, build_triage_input(state, text)),
+                                     TRIAGE_TIMEOUT_S)
+        decided = TriageIntent.model_validate(out.data)
+    except (LLMError, ValidationError, TimeoutError) as exc:
+        log.info("triage model not used: %s", exc.__class__.__name__)
+    return decided, {"tool": TRIAGE_TOOL, "ok": decided is not None, "ms": round((time.perf_counter() - start) * 1000)}
+
+
+def make_triage(mcp: MCPClient, llm: ChatModel | None = None) -> Callable[[AgentState], Awaitable[dict]]:
     """Who is asking, what the status page says, which error codes were given, and where to go next.
 
-    Deterministic: no LLM. The department comes from the directory (lookup_employee) for the conversation's
-    locked email, never from the message. A failed lookup or status call is recorded in tool_calls and never
-    replaced by a guess: employee stays None, and status_checked=False means "no incident" is unknown.
+    The department comes from the directory (lookup_employee) for the conversation's locked email, never from the
+    message. A failed lookup or status call is recorded in tool_calls and never replaced by a guess: employee stays
+    None, and status_checked=False means "no incident" is unknown.
+
+    The checks that protect anything are code and run first: a security request or a verified incident never reaches
+    the model. For the rest, llm (when given) reads what the employee wants; the pattern rules decide when it cannot.
+    The model chooses an intent, never a rule: it cannot lift a refusal, skip approval or change who the employee is.
     """
 
     async def triage(state: AgentState) -> dict:
@@ -317,6 +362,28 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
         # a ticket request take precedence, and a mixed message is never preference-only (see is_preference_only).
         preference_only = (not matched and not topics and not codes and is_preference_only(text)
                            and not wants_ticket and not policy_hit and not clarify_code)
+        decided = None
+        collecting = escalation.collecting(state)
+        if llm is not None and not matched and not policy_hit:
+            decided, call = await classify_intent(llm, state, text)
+            calls.append(call)
+        # Waiting for ticket details: a real answer carries on, and any other message leaves the collection.
+        keeps_collecting = (collecting and not _NEW_QUESTION.search(text)
+                            and (decided is None or decided.intent in ("details", "ticket", "unclear")))
+        left_collection = collecting and not keeps_collecting
+        if left_collection:
+            wants_ticket = False
+        confirmed = decided is not None and decided.intent not in ("details", "unclear") and not keeps_collecting
+        if confirmed and decided.intent == "ticket" and not wants_ticket and not _ASKS_FOR_PEOPLE.search(text):
+            decided = decided.model_copy(update={"intent": "it_question"})
+        if confirmed:
+            _, previous_reply = escalation.last_messages(state.get("messages") or [])
+            wants_ticket = decided.intent == "ticket"
+            show_tickets = decided.intent == "my_tickets"
+            resolved = decided.intent == "resolved" and escalation.RESOLUTION_QUESTION in (previous_reply or "")
+            topics = topics if decided.intent == "status" else []      # the status reply needs a topic from code
+            preference_only = preference_only and decided.intent == "preference"
+            clarify_code = clarify_code and not wants_ticket
         return {
             "employee": employee,
             "codes": codes,
@@ -331,6 +398,12 @@ def make_triage(mcp: MCPClient) -> Callable[[AgentState], Awaitable[dict]]:
                       else "clarify" if clarify_code
                       else "status" if topics else "preference" if preference_only else "retrieve"),
             "tool_calls": calls,
+            **({"ticket_fields": None} if left_collection else {}),
+            "triage_result": {"intent": decided.intent if decided else None, "wants_ticket": bool(wants_ticket),
+                              "no_error_code": not codes and bool(
+                                  (decided and decided.no_error_code) or _NO_ERROR_CODE.search(text)
+                                  or (state.get("triage_result") or {}).get("no_error_code")),
+                              "source": "llm" if decided else "patterns"},
         }
 
     return triage
@@ -495,7 +568,19 @@ def not_documented_reply(codes: list[str]) -> str:
             f"I can escalate it to IT as a ticket so a technician can look into it.")
 
 
+NO_CODE_QUESTION = ("No problem, an error code isn't needed. What exactly happens when you try, and in which app?")
+NO_CODE_OFFER = ("I can't find documented steps for this without more detail, so I won't guess. I can escalate it to "
+                 "IT as a ticket so a technician can look into it.")
+_ASKS_FOR_CODE = re.compile(r"(?i)\b(?:error|code)\b")
+
+
+def no_code_given(state: AgentState) -> bool:
+    return bool((state.get("triage_result") or {}).get("no_error_code"))
+
+
 def clarify_reply(state: AgentState) -> str:
+    if no_code_given(state):             # never ask for what they said they don't have, and never ask twice
+        return NO_CODE_OFFER if state.get("outcome") == "clarify" else NO_CODE_QUESTION
     if not isinstance(state.get("employee"), dict):
         return ("I need a bit more detail to help. What exact error message or code do you see, and what is your "
                 "work email (so I can check which rules apply to you)?")
@@ -638,7 +723,8 @@ def make_answer(llm: ChatModel | None) -> Callable[[AgentState], Awaitable[dict]
         citations = cited(data, evidence)
         if data.get("needs_clarification") is True:
             # A question needs no citation, so it must really be only a question; otherwise ask our own.
-            question = reply if is_safe_clarification(reply) else clarify_reply(state)
+            usable = is_safe_clarification(reply) and not (no_code_given(state) and _ASKS_FOR_CODE.search(reply))
+            question = reply if usable else clarify_reply(state)
             return result(question, "clarify", [], used)
         if not citations:                                   # an answer must rest on the evidence it was given
             return result(UNGROUNDED_REPLY, "not_documented", usage=used)
@@ -761,7 +847,11 @@ def add_usage(first: dict | None, second: dict | None) -> dict:
 
 def route_after_retrieve(state: AgentState) -> str:
     """The conditional edge after retrieve: "escalate" for a ticket request (decided in code from the
-    conversation, see escalation.wants_ticket), otherwise "answer"."""
+    conversation, see escalation.wants_ticket), otherwise "answer". Triage's decision for this turn is used, so the
+    two steps can never disagree; the check on the conversation remains for a state without one."""
+    decided = state.get("triage_result")
+    if isinstance(decided, dict) and isinstance(decided.get("wants_ticket"), bool):
+        return "escalate" if decided["wants_ticket"] else "answer"
     return "escalate" if escalation.wants_ticket(state.get("messages") or [], state) else "answer"
 
 
@@ -830,13 +920,22 @@ def make_escalate(llm: ChatModel | None, mcp: MCPClient | None = None) -> Callab
         # The draft rules (Finance VPN, "completely blocked") read the request as before; across a collection, every
         # answer the employee gave for this ticket.
         request_text = ticket_text if continuing else text
-        values = escalation.prefill(escalation.merge_fields(collected, out.data), state, request_text)
+        proposed = escalation.only_employee_words(out.data, ticket_text)   # never invented: see the function
+        values = escalation.prefill(escalation.merge_fields(collected, proposed), state, request_text)
         intake = escalation.validated_intake(values, state, ticket_text, request_text)   # Pydantic, in code
         if intake is None:
             missing = escalation.missing_fields(values, state, ticket_text, request_text)
             proposed = out.data.get("missing_question") if isinstance(out.data, dict) else None
             question = escalation.missing_question(proposed, missing)
             fields = {"values": values, "missing": missing, "asked": question, "text": ticket_text}
+            return {**result(question, "clarify", usage=out.usage), **memory, "ticket_fields": fields}
+        # One follow-up at most, for details that help IT: the answer, even "I don't know", then goes to the draft.
+        asked = continuing and bool((state.get("ticket_fields") or {}).get("details_asked"))
+        details = [] if asked else escalation.details_to_ask(values, state, request_text)
+        if details:
+            question = escalation.ask_details_reply(details)
+            fields = {"values": values, "missing": details, "asked": question, "text": ticket_text,
+                      "details_asked": True}
             return {**result(question, "clarify", usage=out.usage), **memory, "ticket_fields": fields}
         outcome = escalation.build_draft(escalation.intake_to_fields(intake, values), state, request_text)
         if outcome.kind == "draft":
@@ -925,11 +1024,13 @@ def without_ticket_claims(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def safe_reply(text: str) -> str:
-    """The outgoing reply: secrets redacted, false ticket claims and ticket IDs removed, bounded, never empty."""
+def safe_reply(text: str, verified_ids: frozenset[str] = frozenset()) -> str:
+    """The outgoing reply: secrets redacted, false ticket claims and ticket IDs removed, bounded, never empty.
+    verified_ids: IDs code read from the employee's own ticket this turn; every other ID is still removed."""
     text = redact_secrets(text or "")
     text = without_ticket_claims(text)
-    text = _TICKET_ID.sub(TICKET_ID_REMOVED, text).strip()[:MAX_REPLY_CHARS].strip()
+    text = _TICKET_ID.sub(lambda m: m.group() if m.group() in verified_ids else TICKET_ID_REMOVED, text)
+    text = text.strip()[:MAX_REPLY_CHARS].strip()
     return text or LLM_FAILED_REPLY
 
 
@@ -1076,7 +1177,9 @@ def make_respond(verifier_llm: ChatModel | None = None) -> Callable[[AgentState]
             body = answer_verifier.attribute_sentences(reply.rstrip(), citations, list(state.get("evidence") or []))
             tail = f"\n\nSources: {', '.join(ids)}\n\n{escalation.RESOLUTION_QUESTION}"
             reply = body[:MAX_REPLY_CHARS - len(tail)].rstrip() + tail   # the cap never cuts the tail
-        reply = safe_reply(reply)
+        verified_ids = frozenset(str(t.get("ticket_id")) for t in state.get("tickets") or [] if isinstance(t, dict)
+                                 ) if outcome == my_tickets.OUTCOME else frozenset()
+        reply = safe_reply(reply, verified_ids)
         # The response shows model/evidence citations and, on a refusal, the code-issued SP citation; the state
         # keeps the code-issued ones apart (policy_citations), so they are never mistaken for the model's.
         shown = citations + [{"id": c["id"], "title": c["title"]} for c in policy_citations]

@@ -104,17 +104,41 @@ def test_the_ui_starts_the_session_for_the_signed_in_email_and_keeps_the_token(m
     sent = []
     monkeypatch.setattr(ui, "call_app", lambda path, body, token=None: (sent.append((path, body)) or
                                                                          ({"status": "started"}, "tok-1")))
-    auth = ui.start_session("ui-new", "", FakeRequest(SARA))
-    assert auth == {"session_id": "ui-new", "token": "tok-1"}
-    assert sent == [("/api/session/start", {"session_id": "ui-new", "user": {"email": SARA}})]
+    session_id, auth = ui.start_session("", FakeRequest(SARA))
+    assert session_id.startswith("ui-") and auth == {"session_id": session_id, "token": "tok-1"}
+    assert sent == [("/api/session/start", {"session_id": session_id, "user": {"email": SARA}})]
+    assert ui.start_session("", FakeRequest(SARA))[0] != session_id          # every new chat: a new conversation
 
 
-def test_without_a_signed_in_email_nothing_is_sent_and_a_race_never_overwrites_the_token(monkeypatch):
+def test_without_a_signed_in_email_nothing_is_sent_and_a_refused_start_leaves_no_token(monkeypatch):
     sent = []
     monkeypatch.setattr(ui, "call_app", lambda path, body, token=None: (sent.append(path) or ({}, None)))
-    assert ui.start_session("ui-new", "", FakeRequest(None)) == ui.gr.skip() and sent == []
-    # A first chat message already started it: no token in this answer, auth_state is left untouched.
-    assert ui.start_session("ui-new", "", FakeRequest(SARA)) == ui.gr.skip() and sent == ["/api/session/start"]
+    session_id, auth = ui.start_session("", FakeRequest(None))
+    assert session_id and auth is None and sent == []
+    session_id, auth = ui.start_session("", FakeRequest(SARA))       # refused: the first chat message starts it
+    assert session_id and auth is None and sent == ["/api/session/start"]
+
+
+def test_the_conversation_id_has_one_owner_so_it_can_never_disagree_with_its_token():
+    """The bug this prevents: gr.State(callable) is built once for all tabs and replaced by its own load event, so a
+    load event reading it got a shared id, and the token never matched the tab's real id."""
+    load = next(f for f in ui.demo.fns.values() if getattr(f.fn, "__name__", "") == "start_session")
+    states = [b for b in load.outputs if type(b).__name__ == "State"]
+    assert len(states) == 2 and states[0].value is None and not callable(states[0].value)
+    assert states[0] not in load.inputs                              # it never reads the id: it creates it
+
+
+@pytest.mark.parametrize("handler", ["send", "send_stream"])
+def test_a_message_sent_before_the_page_has_started_stays_in_the_box(handler, monkeypatch):
+    import asyncio
+    import inspect
+    monkeypatch.setattr(ui, "call_app", lambda *a, **k: pytest.fail("nothing may be sent"))
+    result = getattr(ui, handler)("my vpn", [], None, "", None)
+    if inspect.isasyncgen(result):
+        async def first():
+            return [item async for item in result]
+        result = asyncio.run(first())[0]
+    assert result[0] == ui.gr.skip() and result[1] == []
 
 
 def test_preferences_load_after_the_session_starts_without_a_message(monkeypatch):
@@ -141,7 +165,67 @@ def test_my_tickets_loads_from_the_ticket_endpoint_and_never_runs_a_chat_turn(mo
     assert not hasattr(ui, "MY_TICKETS_QUESTION")                # the hidden "Show me all my tickets" is gone
 
 
+def test_a_failed_start_shows_a_clear_message_and_never_stays_on_loading(monkeypatch):
+    monkeypatch.setattr(ui, "call_preferences", lambda *a: pytest.fail("no call without a session"))
+    panel, tickets = ui.load_preferences_on_start("ui-new", None), ui.load_tickets_on_start("ui-new", None)
+    assert ui.START_FAILED in panel and ui.PREF_LOADING not in panel
+    assert ui.html.escape(ui.START_FAILED) in tickets
+
+
+def test_a_failed_load_says_so_and_never_stays_on_loading(monkeypatch):
+    auth = {"session_id": "ui-new", "token": "tok-1"}
+    monkeypatch.setattr(ui, "call_preferences", lambda *a: (False, "The app did not answer."))
+    assert "The app did not answer." in ui.load_preferences_on_start("ui-new", auth)
+    assert "The app did not answer." in ui.load_tickets_on_start("ui-new", auth)
+    monkeypatch.setattr(ui, "call_preferences", lambda *a: (True, {"preferences": "not a dict"}))
+    assert "could not be read" in ui.load_preferences_on_start("ui-new", auth)
+
+
+def test_empty_preferences_and_tickets_show_their_empty_states(monkeypatch):
+    auth = {"session_id": "ui-new", "token": "tok-1"}
+    monkeypatch.setattr(ui, "call_preferences", lambda method, path, sid, a: (True, {"preferences": {}, "tickets": [],
+                                                                                    "filter": {}}))
+    assert "No saved preferences" in ui.load_preferences_on_start("ui-new", auth)
+    assert "You don't have any tickets" in ui.load_tickets_on_start("ui-new", auth)
+
+
+def test_two_employees_get_their_own_session_token_and_data(monkeypatch):
+    issued = {}
+
+    def fake_app(path, body, token=None):
+        issued[body["session_id"]] = body["user"]["email"]
+        return {"status": "started"}, f"tok-{body['user']['email']}"
+
+    def fake_get(method, path, session_id, auth):
+        assert auth == {"session_id": session_id, "token": f"tok-{issued[session_id]}"}   # matched, never crossed
+        return True, {"preferences": {"language": "en"}, "tickets": [{"action_id": issued[session_id],
+                                                                      "subject": issued[session_id]}], "filter": {}}
+
+    monkeypatch.setattr(ui, "call_app", fake_app)
+    monkeypatch.setattr(ui, "call_preferences", fake_get)
+    first = ui.start_session("", FakeRequest(SARA))
+    second = ui.start_session("", FakeRequest("fadi.mansour@nakhla.example"))
+    assert first[0] != second[0]
+    assert SARA in ui.load_tickets_on_start(*first) and "fadi" not in ui.load_tickets_on_start(*first)
+    assert "fadi" in ui.load_tickets_on_start(*second) and SARA not in ui.load_tickets_on_start(*second)
+
+
+def test_only_one_load_event_initialises_the_session_and_the_panels_follow_it():
+    fns = list(ui.demo.fns.values())
+    assert sum(getattr(f.fn, "__name__", "") == "start_session" for f in fns) == 1
+    session = next(f for f in fns if getattr(f.fn, "__name__", "") == "start_session").outputs[0]
+    assert session.load_event_to_attach is None                      # no second load event of its own
+
+
 def test_every_page_load_starts_the_session_then_loads_preferences_and_tickets():
     names = [getattr(f.fn, "__name__", "") for f in ui.demo.fns.values()]
-    for name in ("start_session", "load_preferences_on_start", "refresh_tickets_page"):
+    for name in ("start_session", "load_preferences_on_start", "load_tickets_on_start"):
         assert name in names
+
+
+def test_employees_do_not_wait_for_each_other_and_nothing_per_user_is_shared():
+    assert ui.demo._queue.default_concurrency_limit == 20
+    chat = next(f for f in ui.demo.fns.values() if getattr(f.fn, "__name__", "") == "send_stream")
+    assert chat.concurrency_limit == "default"                       # it uses that limit, not one of its own
+    states = [b for b in ui.demo.blocks.values() if type(b).__name__ == "State"]
+    assert len(states) == 7                                          # per employee values live in gr.State

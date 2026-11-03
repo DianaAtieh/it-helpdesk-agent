@@ -23,7 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent import escalation
-from app.agent.escalation import (ASK_STEPS_REPLY, DUPLICATE_REPLY, duplicate_text, history_signals,
+from app.agent.escalation import (ASK_DESCRIPTION_REPLY, ASK_STEPS_REPLY, DUPLICATE_REPLY, duplicate_text, history_signals,
                                   open_duplicate)
 from app.agent.graph import build_graph
 from app.agent.policy import REFUSALS
@@ -310,11 +310,11 @@ def test_a_yes_to_the_escalation_offer_is_checked_against_the_problem_described_
     assert not re.search(r"IT-\d", out["reply"])
 
 
-def test_an_answer_to_the_steps_question_is_checked_against_the_original_request():
+def test_an_answer_to_the_description_question_is_checked_for_a_duplicate():
     graph, mcp, llm = make(dict(FIELDS, attempted_steps=[]), FIELDS)
-    first = turn(graph, "I can't use my monitors. Please open a ticket.", BASHAR)
-    assert (first["outcome"], first["reply"]) == ("clarify", ASK_STEPS_REPLY)   # "monitor" alone: not a duplicate
-    out = turn(graph, "I updated the Nakhla Dock D3 firmware and restarted.", BASHAR)
+    first = turn(graph, "Please open a ticket.", BASHAR)
+    assert (first["outcome"], first["reply"]) == ("clarify", ASK_DESCRIPTION_REPLY)
+    out = turn(graph, "The Nakhla Dock D3 firmware update did not help.", BASHAR)
     assert (out["outcome"], out["reply"], out["draft"]) == ("blocked", DUPLICATE_REPLY, None)
     assert len(mcp.searched()) == 2
 

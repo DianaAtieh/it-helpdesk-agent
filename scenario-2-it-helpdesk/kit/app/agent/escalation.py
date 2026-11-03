@@ -179,7 +179,11 @@ def wants_ticket(messages: list, state: dict | None = None) -> bool:
 
 # ---------------------------------------------------------------- mandatory ticket fields, collected over turns
 #
-# TicketIntake is the structured, strict schema of what a ticket needs to know about the PROBLEM. It reuses the ticket
+# TicketIntake is the structured, strict schema of what a ticket needs to know about the PROBLEM. Two kinds of field:
+#   needed for a valid ticket   the description (the employee's own words) and the location: always collected
+#   improves the ticket         device, error code, attempted steps: asked for once, together, and only when the
+#                               request gives neither an error code nor a step (details_to_ask)
+# A detail the employee did not give stays None and is left out of the draft, never guessed. It reuses the ticket
 # contract's names (dataset/schemas/ticket.schema.json: subject, description, priority, affected_users,
 # attempted_steps) and adds what that contract has no field for (device, operating system, location, error code,
 # device name). The helpdesk API accepts no extra properties, so those go into the ticket's description as a
@@ -192,6 +196,9 @@ def wants_ticket(messages: list, state: dict | None = None) -> bool:
 
 DEVICE_TYPES = ("laptop", "desktop", "phone", "tablet", "printer", "monitor", "dock", "other")
 URGENCIES = MODEL_PRIORITIES                  # P2 | P3 | P4 from the employee's answer; P1 only ever from a rule
+FROM_DIRECTORY = " (from directory)"
+# The ticket contract needs one attempted step. When the employee named none, this says so; it is never a step taken.
+STEPS_NOT_PROVIDED = "Not provided by the employee"
 
 
 class TicketIntake(BaseModel):
@@ -200,13 +207,13 @@ class TicketIntake(BaseModel):
 
     subject: str = Field(min_length=5, max_length=SUBJECT_MAX)              # the issue title
     description: str = Field(min_length=10, max_length=DESCRIPTION_MAX)     # the problem, in the employee's words
-    device_type: Literal[DEVICE_TYPES]
-    operating_system: str = Field(min_length=2, max_length=60)
+    device_type: Literal[DEVICE_TYPES] | None = None                        # optional: never asked
+    operating_system: str | None = Field(default=None, min_length=2, max_length=60)   # optional: never asked
     location: str = Field(min_length=2, max_length=60)                      # an office, or remote
     affected_users: int = Field(default=1, ge=1, le=1000)   # optional: only when the employee says so (never asked)
-    priority: Literal[URGENCIES]                                            # the urgency
-    attempted_steps: list[Annotated[str, Field(min_length=3, max_length=STEP_MAX)]] = Field(
-        min_length=1, max_length=STEPS_MAX)
+    priority: Literal[URGENCIES] | None = None      # the urgency; None: build_draft's default and rules decide
+    attempted_steps: list[Annotated[str, Field(min_length=3, max_length=STEP_MAX)]] = Field(   # only what they did
+        default_factory=list, max_length=STEPS_MAX)
     error_code: str | None = Field(default=None, max_length=20)             # optional
     device_name: str | None = Field(default=None, max_length=80)            # optional (hostname)
 
@@ -224,12 +231,7 @@ _ADAPTERS = {name: TypeAdapter(Annotated[f.annotation, *f.metadata] if f.metadat
 # What to ask for each field the employee must give. The subject is written from the description, never asked.
 ASK_FOR = {
     "description": "what exactly is happening (the problem and any error message you see)",
-    "device_type": "which device it is on (laptop, desktop, phone, tablet, printer, ...)",
-    "operating_system": "which operating system the device runs (Windows, macOS, Linux, ...)",
     "location": "where you are working from (which office, or remote)",
-    "priority": ("how urgent it is: completely blocked with no workaround, a workaround exists, or a request or "
-                 "question"),
-    "attempted_steps": "what you have already tried to fix it",
 }
 EMPLOYEE_FIELDS = tuple(ASK_FOR)
 ASK_DESCRIPTION_REPLY = ("Before I prepare the ticket: what exactly is happening? Please describe the problem and "
@@ -243,11 +245,17 @@ _FIELD_WORDS = {
     "priority": re.compile(r"(?i)\b(?:urgent|urgency|blocked|workaround|priority)\b"),
     "attempted_steps": re.compile(r"(?i)\b(?:tried|try|steps?|attempted|done\s+so\s+far)\b"),
 }
+# The details that help IT but are not needed for a valid ticket: asked together, in one question, at most once.
+ASK_DETAILS = {
+    "device_type": "which device it is on (laptop, desktop, phone, tablet, printer, ...)",
+    "error_code": "any error code or message you see",
+    "attempted_steps": "what you have already tried",
+}
 # Words that carry no description of a problem: a bare "please open a ticket" describes nothing.
 _FILLER = frozenset("""
     a an the i me my we you your it this that is are am be can could would will please pls hi hello hey thanks
     thank ok okay yes yeah sure need want help for to of and with just now so do something issue problem ticket
-    support it's i'm can't
+    support it's i'm can't on in at
 """.split())
 
 
@@ -263,8 +271,12 @@ def ask_reply(missing: list[str]) -> str:
     return "Before I prepare the ticket, please tell me:\n" + "\n".join(f"- {a}" for a in asks)
 
 
-# Kept for callers and tests that ask for the two original fields together.
-ASK_BOTH_REPLY = ask_reply(["description", "attempted_steps"])
+def ask_details_reply(missing: list[str]) -> str:
+    """The one follow-up for exactly the details still missing. It says what is needed and that it can be skipped."""
+    asks = [ASK_DETAILS[f] for f in missing if f in ASK_DETAILS]
+    wanted = asks[0] if len(asks) == 1 else ", ".join(asks[:-1]) + f", and {asks[-1]}"
+    return (f"Before I prepare the ticket, these details will help IT fix this faster: {wanted}. "
+            "If you don't know or it doesn't apply, just say so.")
 
 
 def collecting(state: dict) -> bool:
@@ -295,11 +307,9 @@ _ANY_CODE = re.compile(r"(?i)(?<![a-z0-9])[a-z]{2,5}[-\s]?\d{2,5}(?![a-z0-9])")
 
 
 def describes_problem(text: str) -> bool:
-    """An error code ("nx-781" is a description on its own), or at least two meaningful words once the ticket
-    request itself is removed (never a bare "open a ticket")."""
-    rest = _TICKET_REQUEST.sub(" ", text or "")
-    if _ANY_CODE.search(rest):
-        return True
+    """At least two meaningful words once the ticket request and any error codes are removed: an error code or a bare
+    "open a ticket" does not say what is wrong."""
+    rest = _ANY_CODE.sub(" ", _TICKET_REQUEST.sub(" ", text or ""))
     words = re.findall(r"[a-z0-9][a-z0-9'-]*", rest.lower())
     return len([w for w in words if w not in _FILLER]) >= 2
 
@@ -335,6 +345,26 @@ def merge_fields(previous: dict | None, proposed) -> dict:
     return values
 
 
+def _stems(text: str) -> set[str]:
+    return {word[:5] for word in re.findall(r"[a-z0-9][a-z0-9-]*", (text or "").lower())
+            if len(word) >= 4 and word not in _FILLER}
+
+
+def only_employee_words(proposed, text: str) -> dict:
+    """The model's fields without steps, an operating system, a device or an error code the employee never mentioned:
+    those are facts about what happened, so a step copied from the evidence or an OS taken from the directory never
+    counts as the employee's. A word is matched on its stem, so "restarted" supports "restart"."""
+    proposed = dict(proposed) if isinstance(proposed, dict) else {}
+    said = _stems(text)
+    proposed["attempted_steps"] = [step for step in _steps(proposed.get("attempted_steps")) if _stems(step) & said]
+    for name in ("operating_system", "device_type", "device_name"):
+        if not _stems(str(proposed.get(name) or "")) & said:
+            proposed[name] = None
+    if str(proposed.get("error_code") or "").lower() not in (text or "").lower():
+        proposed["error_code"] = None
+    return proposed
+
+
 def is_finance_vpn(state: dict, text: str) -> bool:
     employee = state.get("employee") if isinstance(state.get("employee"), dict) else {}
     return employee.get("department") == FINANCE and (is_vpn_topic(text, list(state.get("codes") or []))
@@ -344,15 +374,21 @@ def is_finance_vpn(state: dict, text: str) -> bool:
 def prefill(values: dict, state: dict, request_text: str) -> dict:
     """What code already knows, so the employee is never asked for it: the location of the directory record (the
     employee may still give another), the error code from the message, the Finance VPN step, and a subject written
-    from the description. The operating system is always asked: the device with the problem may not be the one the
-    directory lists."""
+    from the description. The directory's operating system is only a fallback, labelled as such: the device with the
+    problem may not be the one the directory lists, so an OS the employee gave always wins."""
     values = dict(values)
     employee = state.get("employee") if isinstance(state.get("employee"), dict) else {}
     if not values.get("location") and _valid("location", employee.get("location")):
         values["location"] = _valid("location", employee.get("location"))
+    directory_os = _valid("operating_system", employee.get("device_os"))
+    if not values.get("operating_system") and directory_os:
+        values["operating_system"] = _valid("operating_system", f"{directory_os}{FROM_DIRECTORY}")
     codes = list(state.get("codes") or [])
     if not values.get("error_code") and codes:
         values["error_code"] = codes[0]
+    if not values.get("device_type"):                   # named in the employee's words: never asked for again
+        said = re.findall(r"[a-z]+", (collection_text(state) or request_text or "").lower())
+        values["device_type"] = next((word for word in said if word in DEVICE_TYPES and word != "other"), None)
     if not values.get("attempted_steps") and is_finance_vpn(state, request_text):
         values["attempted_steps"] = [FINANCE_VPN_STEP]
     if not values.get("subject") and values.get("description"):
@@ -368,7 +404,7 @@ def missing_fields(values: dict, state: dict, text: str, request_text: str | Non
         TicketIntake.model_validate(values)
     except ValidationError as exc:
         missing = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
-    if not describes_problem(text):
+    if not describes_problem(text) and not is_finance_vpn(state, request_text or text):   # that route needs no more
         missing.add("description")
     if "subject" in missing and "description" not in missing:
         missing.discard("subject")                     # written from the description by prefill, never asked
@@ -382,29 +418,44 @@ def validated_intake(values: dict, state: dict, text: str, request_text: str | N
     return TicketIntake.model_validate(values)
 
 
+def details_to_ask(values: dict, state: dict, request_text: str) -> list[str]:
+    """The details worth one follow-up, or [] when the draft can be prepared now. A request with an error code or a
+    step the employee took is ready; Finance VPN problems are never troubleshot with the employee (KB-016)."""
+    if values.get("error_code") or values.get("attempted_steps") or is_finance_vpn(state, request_text):
+        return []
+    return [name for name in ASK_DETAILS if not values.get(name)]
+
+
 def missing_question(proposed: str | None, missing: list[str]) -> str:
     """The model's question if it asks for exactly the missing fields (and nothing already given), else a fixed one."""
     question = " ".join(proposed.split())[:400] if isinstance(proposed, str) else ""
     if (question.endswith("?") and not re.search(r"https?://|\d", question)
             and all(_FIELD_WORDS[f].search(question) for f in missing if f in _FIELD_WORDS)
-            and not any(_FIELD_WORDS[f].search(question) for f in EMPLOYEE_FIELDS if f not in missing)
-            and not _FIELD_WORDS["affected_users"].search(question)):        # never asked
+            and not any(words.search(question) for f, words in _FIELD_WORDS.items() if f not in missing)):
         return question
     return ask_reply(missing)
+
+
+def _details(intake: TicketIntake) -> list[tuple[str, str]]:
+    """The details the employee or the directory gave, as (label, value). An unknown one is left out, never guessed."""
+    device = " ".join(v for v in (intake.device_type, f"({intake.device_name})" if intake.device_name else None) if v)
+    rows = [("Device", device), ("Operating system", intake.operating_system), ("Location", intake.location)]
+    return [(label, value) for label, value in rows if value]
 
 
 def intake_to_fields(intake: TicketIntake, proposed: dict) -> dict:
     """The ticket contract's fields from a complete intake: the details the contract has no field for go into the
     description, in a fixed "Details" block. category and kb_refs are the model's suggestions (build_draft checks)."""
-    device = intake.device_type + (f" ({intake.device_name})" if intake.device_name else "")
-    details = [f"- Device: {device}", f"- Operating system: {intake.operating_system}",
-               f"- Location: {intake.location}", f"- Urgency given: {intake.priority}"]
+    details = [f"- {label}: {value}" for label, value in _details(intake)]
+    if intake.priority:
+        details.append(f"- Urgency given: {intake.priority}")
     if intake.error_code:
         details.insert(0, f"- Error code: {intake.error_code}")
     proposed = proposed if isinstance(proposed, dict) else {}
     return {"subject": intake.subject, "description": f"{intake.description}\n\nDetails:\n" + "\n".join(details),
             "category": proposed.get("category"), "priority": intake.priority,
-            "attempted_steps": list(intake.attempted_steps), "affected_users": intake.affected_users,
+            "attempted_steps": list(intake.attempted_steps) or [STEPS_NOT_PROVIDED],
+            "affected_users": intake.affected_users,
             "kb_refs": proposed.get("kb_refs") or []}
 
 
@@ -430,20 +481,22 @@ def draft_summary(draft: dict, employee: dict | None = None, intake=None) -> str
     if intake is not None:
         description = intake.description
     employee = employee if isinstance(employee, dict) else {}
+    tried = [step for step in draft.get("attempted_steps") or [] if step != STEPS_NOT_PROVIDED]
     who = " · ".join(str(v) for v in (employee.get("name"), employee.get("employee_id"), draft.get("requester_email"))
                      if v)
     lines = [f"- Employee: {who}"] if who else []
     lines += [f"- Subject: {draft.get('subject', '')}",
               f"- Description: {' '.join(description.split())[:300]}"]
     if intake is not None:
-        device = intake.device_type + (f" ({intake.device_name})" if intake.device_name else "")
-        lines += [f"- Error code: {intake.error_code or 'none given'}", f"- Device: {device}",
-                  f"- Operating system: {intake.operating_system}", f"- Location: {intake.location}",
-                  f"- People affected: {intake.affected_users}"]
+        if intake.error_code:
+            lines.append(f"- Error code: {intake.error_code}")
+        lines += [f"- {label}: {value}" for label, value in _details(intake)]
+        lines.append(f"- People affected: {intake.affected_users}")
     lines += [f"- Category: {draft.get('category', '')}",
               f"- Priority: {draft.get('priority', '')}",
-              f"- Department: {draft.get('department', '')}",
-              f"- Steps already tried: {'; '.join(draft.get('attempted_steps') or [])}"]
+              f"- Department: {draft.get('department', '')}"]
+    if tried:
+        lines.append(f"- Steps already tried: {'; '.join(tried)}")
     if draft.get("kb_refs"):
         lines.append(f"- Related articles: {', '.join(draft['kb_refs'])}")
     return "Ticket summary:\n" + "\n".join(lines)
