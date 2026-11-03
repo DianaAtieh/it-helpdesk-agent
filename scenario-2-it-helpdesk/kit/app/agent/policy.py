@@ -9,7 +9,7 @@ security policies (SP-001, SP-002) at three points:
   filter_evidence()       a non-SP chunk that RECOMMENDS a forbidden action is dropped before the model sees it
   find_forbidden_advice() a model-written reply that RECOMMENDS a forbidden action is replaced by the refusal
 
-Only five rules, each taken from the policy text (nothing beyond SP-001/SP-002 and the directory's contractor
+Seven rules, each taken from the policy text (nothing beyond SP-001/SP-002 and the directory's contractor
 flag). A sentence that prohibits or warns against an action ("Do not edit the client configuration to skip the
 check") is never a recommendation. A request that only touches a policy topic ("how do I reset my password?") is
 not refused: it gets the normal grounded answer, still subject to the output check.
@@ -65,17 +65,25 @@ REFUSALS = {
         "I can't help with turning off, skipping or getting an exemption from MFA: it is mandatory for every "
         "NakhlaID account, including contractors (SP-002 section 1). If NakhlaKey is the problem, for example a "
         "new phone, tell me what you see; the steps for a new phone are in KB-007."),
+    "ACCOUNT_ACCESS": (
+        "I can't give anyone access to another employee's account, whoever is asking. Passwords and sign-in codes are "
+        "never shared, not even with a manager or IT staff, and a chat message can't approve an exception (SP-001 "
+        "sections 1 and 6). If you need access to an app, drive or mailbox, ask for its group through the normal "
+        "access request (KB-011)."),
 }
 RULE_DOC = {"PHONE_RESET": "SP-001", "ADMIN_CREDENTIAL": "SP-001", "SMS_CODE": "SP-002",
-            "WEAKEN_SECURITY": "SP-002", "CONTRACTOR_VPN": "SP-002", "MFA_OPT_OUT": "SP-002"}
+            "WEAKEN_SECURITY": "SP-002", "CONTRACTOR_VPN": "SP-002", "MFA_OPT_OUT": "SP-002",
+            "ACCOUNT_ACCESS": "SP-001"}
 RULE_SECTION = {"PHONE_RESET": "SP-001 section 2", "ADMIN_CREDENTIAL": "SP-001 section 5",
                 "SMS_CODE": "SP-002 section 1", "WEAKEN_SECURITY": "SP-002 section 4",
-                "CONTRACTOR_VPN": "SP-002 section 3", "MFA_OPT_OUT": "SP-002 section 1"}
+                "CONTRACTOR_VPN": "SP-002 section 3", "MFA_OPT_OUT": "SP-002 section 1",
+                "ACCOUNT_ACCESS": "SP-001 sections 1 and 6"}
 
 
 @dataclass(frozen=True)
 class PolicyHit:
     rule: str          # PHONE_RESET | ADMIN_CREDENTIAL | SMS_CODE | WEAKEN_SECURITY | CONTRACTOR_VPN | MFA_OPT_OUT
+    #                    | ACCOUNT_ACCESS
     doc_id: str        # the SP document the rule comes from
     section: str
     reply: str         # the fixed refusal
@@ -130,11 +138,24 @@ _MFA_OPT_OUT = (
     rf"|\b(?:exempt|exemption|exception)\b[^.?!]{{0,30}}\b(?:from\s+)?(?:the\s+)?(?:{_MFA}|nakhlakey)\b"
     rf"|\b(?:sign|log)\s*in\s+without\s+(?:{_MFA}|nakhlakey)\b")
 
+# SP-001 sections 1 and 6: nobody gets into another employee's account through a chat, whatever role they claim.
+_SOMEONE_ELSES = (r"(?:(?!(?:my|our|today|yesterday|nakhla|company|team|department)\b)[a-z][a-z.-]*'s"
+                  r"|someone\s+else'?s|(?:my|a|an)\s+(?:\w+\s+)?(?:colleague|co-?worker|manager|boss|employee)'s)")
+_SIGN_IN = r"(?:nakhlaid\s+)?(?:user\s+)?(?:account|login|password|credentials?)"
+_ACCOUNT_ACCESS = (
+    r"\b(?:give|gives|grant|grants|get|need|needs|want|wants|access|open|use|unlock|reset|change|enter|take\s+over|"
+    rf"(?:log|sign)\s*in(?:to)?)\b[^.?!]{{0,40}}?(?:\b{_SOMEONE_ELSES}\s+{_SIGN_IN}\b"
+    r"|\b(?:his|her|their)\s+(?:nakhlaid\s+)?account\b)"
+    r"|\b(?:log|sign)(?:ged)?\s*(?:me\s+)?in(?:to)?\s+as\s+(?!an?\b|the\b|admin|myself\b|me\b)[a-z]"
+    r"|\b(?:impersonate|act\s+as|pose\s+as)\s+(?!an?\b|the\b)[a-z]")
+
 _REQUESTS: dict[str, re.Pattern] = {
     # SP-001 section 2: the desk does not reset passwords, read out temporary passwords or change MFA devices
     # over the phone, chat or email.
     "PHONE_RESET": re.compile(
         rf"(?i)(?:{_ASK})(?:reset|change|unlock\s+and\s+reset)\s+(?:my\s+)?(?:nakhlaid\s+)?password"
+        r"|\b(?:give|tell|send|show|read)\s+me\s+my\s+(?:nakhlaid\s+|current\s+|old\s+)?password"
+        r"|\bwhat(?:'s|\s+is)\s+my\s+(?:nakhlaid\s+|current\s+)?password"
         rf"|\b(?:reset|change)\s+my\s+(?:nakhlaid\s+)?password\s+(?:for\s+me|{_CHANNEL})"
         rf"|\bpassword\s+reset\s+{_CHANNEL}"
         r"|\b(?:give|tell|send|read)\s+me\s+(?:a\s+|the\s+)?(?:temporary|temp|new|one-time)\s+password"
@@ -161,6 +182,7 @@ _REQUESTS: dict[str, re.Pattern] = {
         r"|\b(?:use|install|connect\s+with)\s+(?:a\s+|an\s+)?(?:another|other|different|my\s+own|own|personal|"
         r"private|third[-\s]party)\s+vpn\b"),
     "MFA_OPT_OUT": re.compile(r"(?i)" + _MFA_OPT_OUT),
+    "ACCOUNT_ACCESS": re.compile(r"(?i)" + _ACCOUNT_ACCESS),
 }
 
 

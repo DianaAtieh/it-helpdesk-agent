@@ -78,6 +78,11 @@ def checkpoint_db_path() -> Path:
     return path if path.is_absolute() else KIT / path
 
 
+def triage_llm_enabled() -> bool:
+    """TRIAGE_LLM: the model reads what the employee wants. On unless set to 0, false, no or off."""
+    return (os.getenv("TRIAGE_LLM") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def answer_verification_enabled() -> bool:
     """ANSWER_VERIFICATION, read when the app starts: the AI verifier of final answers (app/agent/answer_verifier.py)
     is ON unless it is set to 0 / false / no / off. Unset or empty means on."""
@@ -127,7 +132,8 @@ async def lifespan(app: FastAPI):
         verify_answers = answer_verification_enabled()
         app.state.graph = build_graph(checkpointer, mcp, app.state.kb, app.state.llm,
                                       evaluate_evidence=os.getenv("EVIDENCE_EVALUATION", "").strip().lower() in ("1", "true", "yes", "on"),
-                                      verify_answers=verify_answers, tickets=tickets_mcp)
+                                      verify_answers=verify_answers, tickets=tickets_mcp,
+                                      classify_intent=triage_llm_enabled())
         log.info("answer verification: %s", "on" if verify_answers else "off")
         expired = await delete_expired_threads(checkpointer)
         log.info("checkpointer ready: %s (%d conversations idle for more than %d days deleted)",

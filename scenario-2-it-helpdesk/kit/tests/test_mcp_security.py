@@ -82,7 +82,7 @@ def started_client() -> tuple[HelpdeskMCP, RecordingSession]:
 
 
 def test_the_allowlist_is_exactly_the_three_read_tools_and_create_ticket():
-    assert READ_TOOLS == {"lookup_employee", "get_service_status", "search_tickets"}
+    assert READ_TOOLS == {"lookup_employee", "get_service_status", "search_tickets", "get_ticket"}
     assert APPROVED_WRITE_TOOLS == {"create_ticket"}
 
 
@@ -93,7 +93,7 @@ def test_read_tools_work_without_approval(tool):
     assert data["ok"] is True and call.ok and session.calls == [tool]
 
 
-@pytest.mark.parametrize("tool", ["create_ticket", "add_ticket_note", "get_ticket", "delete_ticket", "", "CREATE_TICKET"])
+@pytest.mark.parametrize("tool", ["create_ticket", "add_ticket_note", "delete_ticket", "", "CREATE_TICKET"])
 def test_unapproved_calls_to_write_or_unknown_tools_never_reach_the_server(tool):
     client, session = started_client()
     data, call = asyncio.run(client.call(tool, {"subject": "x"}))
@@ -101,7 +101,7 @@ def test_unapproved_calls_to_write_or_unknown_tools_never_reach_the_server(tool)
     assert session.calls == []
 
 
-@pytest.mark.parametrize("tool", ["add_ticket_note", "get_ticket", "lookup_employee_x", "search_tickets "])
+@pytest.mark.parametrize("tool", ["add_ticket_note", "lookup_employee_x", "search_tickets "])
 def test_approval_does_not_unlock_other_tools(tool):
     client, session = started_client()
     data, _ = asyncio.run(client.call(tool, {}, approved=True))

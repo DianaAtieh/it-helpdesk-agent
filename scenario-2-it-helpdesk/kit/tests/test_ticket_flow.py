@@ -2,8 +2,8 @@
 
     issue -> answer citing inline ("According to KB-002, ..."), a "Sources: KB-002" line and the resolution question
           -> "it's fixed"        -> resolved, no ticket, no model call
-          -> "open a ticket"     -> the mandatory employee fields (description, attempted_steps) are collected over
-                                    turns, enforced in code; a summary and an approval request only when complete
+          -> "open a ticket"     -> a clear request is drafted in one turn; only a missing description is asked for
+                                    (over turns, enforced in code); a summary and an approval request when complete
           -> Approve             -> /api/approve files the ticket (API tests: tests/test_api_tickets.py fixtures)
 
 Graph tests are offline (fake model, knowledge base and MCP, from tests/test_escalate_graph.py). Run from the kit
@@ -16,14 +16,18 @@ from __future__ import annotations
 import pytest
 
 from app.agent import escalation
-from app.agent.escalation import (APPROVAL_REQUEST, ASK_BOTH_REPLY, ASK_DESCRIPTION_REPLY, ASK_STEPS_REPLY,
-                                  DRAFT_READY_REPLY, RESOLUTION_QUESTION, RESOLVED_REPLY)
+from langgraph.checkpoint.memory import InMemorySaver
+
+from app.agent.escalation import (APPROVAL_REQUEST, ASK_DESCRIPTION_REPLY, ASK_STEPS_REPLY, DRAFT_READY_REPLY,
+                                  NO_EMPLOYEE_REPLY, RESOLUTION_QUESTION, RESOLVED_REPLY,
+                                  STEPS_NOT_PROVIDED)
 from app.agent.graph import build_graph
 from app.main import app, mcp
+from app.schemas import ToolCall
 from tests.fakes import FakeChat, FakeKnowledgeBase, kb_result
 from tests.helpers import created_tickets, requires_api
 from tests.test_api_tickets import KB002, approve, chat
-from tests.test_escalate_graph import ANSWER, FADI, FIELDS, make, saved, systems, turn
+from tests.test_escalate_graph import ANSWER, DIRECTORY, FADI, FIELDS, SARA, DataMCP, make, saved, systems, turn
 from tests.test_ui_pages import ui
 
 NO_STEPS = dict(FIELDS, attempted_steps=[], missing_question="")
@@ -89,27 +93,31 @@ def _after_answer(text: str) -> list:
 
 # ------------------------------------------------------------- mandatory fields, collected over turns
 
-def test_a_ticket_request_with_nothing_described_asks_for_both_fields_and_drafts_nothing():
+def test_a_ticket_request_with_nothing_described_asks_for_the_problem_and_drafts_nothing():
     graph, mcp, kb, llm = make(NOTHING)
     out = turn(graph, "Please open a ticket.")
-    assert (out["outcome"], out["reply"], out["draft"]) == ("clarify", ASK_BOTH_REPLY, None)
+    assert (out["outcome"], out["reply"], out["draft"]) == ("clarify", ASK_DESCRIPTION_REPLY, None)
     fields = saved(graph)["ticket_fields"]
-    assert fields["missing"] == ["description", "attempted_steps"] and fields["asked"] == ASK_BOTH_REPLY
+    assert fields["missing"] == ["description"] and fields["asked"] == ASK_DESCRIPTION_REPLY
 
 
-def test_partial_information_asks_only_for_the_remaining_field_and_keeps_what_was_given():
-    graph, mcp, kb, llm = make(NO_STEPS, dict(FIELDS, description="", attempted_steps=["Restarted the laptop"]))
-    first = turn(graph, "My VPN shows NX-112 since this morning. Please open a ticket.")
-    assert (first["outcome"], first["reply"], first["draft"]) == ("clarify", ASK_STEPS_REPLY, None)
-    assert saved(graph)["ticket_fields"]["missing"] == ["attempted_steps"]
-    # The model returns an EMPTY description on the second turn: the first turn's description is preserved.
-    second = turn(graph, "I restarted the laptop.")
+def test_no_attempted_steps_is_recorded_as_not_provided_and_is_never_a_step_taken():
+    graph, mcp, kb, llm = make(NO_STEPS)
+    out = turn(graph, "My VPN shows NX-112 since this morning. Please open a ticket.")
+    assert out["outcome"] == "draft_proposed" and out["draft"]["attempted_steps"] == [STEPS_NOT_PROVIDED]
+    assert "Steps already tried" not in out["reply"]                       # the summary never calls it a step
+    assert "create_ticket" not in mcp.calls
+
+
+def test_a_description_given_on_a_later_turn_completes_the_draft_and_is_kept():
+    graph, mcp, kb, llm = make(NOTHING, dict(FIELDS, attempted_steps=["Restarted the laptop"]))
+    first = turn(graph, "Please open a ticket.")
+    assert (first["outcome"], first["reply"], first["draft"]) == ("clarify", ASK_DESCRIPTION_REPLY, None)
+    second = turn(graph, "My VPN shows NX-112 since this morning, and I restarted the laptop.")
     assert second["outcome"] == "draft_proposed" and second["draft"]
     assert second["draft"]["description"].startswith(FIELDS["description"] + "\n\nDetails:")
     assert second["draft"]["attempted_steps"] == ["Restarted the laptop"]
     assert systems(llm) == ["escalate", "escalate"]
-    # The model saw the value collected on the first turn.
-    assert FIELDS["description"] in llm.calls[1]["user"]
 
 
 def test_the_model_question_is_used_only_when_it_asks_for_exactly_the_missing_fields():
@@ -118,7 +126,7 @@ def test_the_model_question_is_used_only_when_it_asks_for_exactly_the_missing_fi
     assert escalation.missing_question("What is the problem, and what have you tried?",
                                        ["attempted_steps"]) == ASK_STEPS_REPLY        # asks for a given field too
     assert escalation.missing_question("Which OS are you on?", ["description"]) == ASK_DESCRIPTION_REPLY
-    assert escalation.missing_question("", ["description", "attempted_steps"]) == ASK_BOTH_REPLY
+    assert escalation.missing_question("", ["description"]) == ASK_DESCRIPTION_REPLY
 
 
 def test_a_description_the_employee_never_gave_is_not_accepted():
@@ -163,16 +171,14 @@ def test_finance_vpn_keeps_its_fixed_step_and_needs_no_steps_question():
 
 @requires_api
 @pytest.mark.usefixtures("clean")
-def test_after_the_fields_are_collected_only_approval_files_exactly_one_ticket(client, monkeypatch):
-    llm = FakeChat(NO_STEPS, dict(FIELDS, description="", attempted_steps=["Restarted the laptop"]))
+def test_a_clear_request_needs_one_turn_and_only_approval_files_exactly_one_ticket(client, monkeypatch):
+    llm = FakeChat(dict(FIELDS, attempted_steps=["Restarted the laptop"]))
     graph = build_graph(app.state.checkpointer, mcp, FakeKnowledgeBase(kb_result(KB002, codes=("NX-112",))), llm)
     monkeypatch.setattr(app.state, "graph", graph)
-    first = chat(client, "s-flow", "My VPN shows NX-112 since this morning. Please open a ticket.")
-    assert first["state"] == "clarify" and first["pending_action"] is None and created_tickets() == []
-    second = chat(client, "s-flow", "I restarted the laptop.")
-    assert second["state"] == "await_approval" and second["reply"].endswith(APPROVAL_REQUEST)
+    out = chat(client, "s-flow", "My VPN shows NX-112 and I restarted the laptop. Please open a ticket.")
+    assert out["state"] == "await_approval" and out["reply"].endswith(APPROVAL_REQUEST)
     assert created_tickets() == []                                       # the summary alone files nothing
-    action = second["pending_action"]["action_id"]
+    action = out["pending_action"]["action_id"]
     done = approve(client, "s-flow", action)
     assert done["state"] == "ticket_created" and done["result"]["ticket_id"] in done["reply"]
     [ticket] = created_tickets()
@@ -191,7 +197,7 @@ def test_an_error_code_alone_describes_the_problem_for_a_finance_vpn_ticket():
     out = turn(graph, "create me ticket please", email=FADI)
     assert out["outcome"] == "draft_proposed" and out["draft"]["category"] == "security"
     assert out["draft"]["attempted_steps"] == [escalation.FINANCE_VPN_STEP]
-    assert escalation.describes_problem("nx-781\ncreate me ticket please")
+    assert not escalation.describes_problem("nx-781\ncreate me ticket please")   # only this route accepts it
     assert not escalation.describes_problem("create me ticket please")
 
 
@@ -234,16 +240,25 @@ COMPLETE = {"description": "NakhlaConnect shows NX-112 since this morning.", "de
 
 def test_each_mandatory_field_is_reported_missing_by_the_schema():
     assert _missing_after(COMPLETE) == []
-    assert _missing_after(dict(COMPLETE, device_type=None)) == ["device_type"]
-    assert _missing_after(dict(COMPLETE, operating_system=None)) == ["operating_system"]
-    assert _missing_after(dict(COMPLETE, priority=None)) == ["priority"]            # the urgency
+    assert _missing_after(dict(COMPLETE, location=None)) == ["location"]
     assert _missing_after(dict(COMPLETE, affected_users=None)) == []          # the impact is never asked
     assert "description" in _missing_after(dict(COMPLETE, description=""), text="Please open a ticket.")
 
 
-def test_invalid_values_are_never_stored_and_count_as_missing():
-    assert _missing_after(dict(COMPLETE, device_type="toaster")) == ["device_type"]
-    assert _missing_after(dict(COMPLETE, priority="urgent!!")) == ["priority"]
+def test_details_the_employee_did_not_give_are_not_mandatory_and_never_guessed():
+    for field in ("device_type", "operating_system", "priority", "attempted_steps"):
+        assert _missing_after(dict(COMPLETE, **{field: None})) == []
+    graph, mcp, kb, llm = make(dict(FIELDS, device_type=None, operating_system=None, priority=None))
+    out = turn(graph, "NX-112 again after a sync and a restart. Please open a ticket.")
+    assert out["outcome"] == "draft_proposed" and out["draft"]["priority"] == escalation.DEFAULT_PRIORITY
+    assert "- Device:" not in out["draft"]["description"] and "- Device:" not in out["reply"]
+    assert "- Urgency given:" not in out["draft"]["description"]
+
+
+def test_invalid_values_are_never_stored():
+    values = escalation.merge_fields({}, dict(COMPLETE, device_type="toaster", priority="urgent!!"))
+    assert "device_type" not in values and "priority" not in values
+    assert _missing_after(dict(COMPLETE, device_type="toaster", priority="urgent!!")) == []
     assert escalation.merge_fields({}, dict(COMPLETE, affected_users=True)).get("affected_users") is None   # dropped
     assert _missing_after(dict(COMPLETE, affected_users=True)) == []          # optional: the contract default (1)
 
@@ -254,29 +269,13 @@ def test_optional_fields_may_stay_empty():
     assert intake is not None and intake.error_code is None and intake.device_name is None
 
 
-def test_the_directory_fills_the_location_but_the_operating_system_is_always_asked():
-    employee = {"device_os": "macOS 15", "location": "Jerusalem HQ"}
-    assert _missing_after(dict(COMPLETE, operating_system=None, location=None), employee) == ["operating_system"]
-    assert "operating system" in escalation.ask_reply(["operating_system"])
-    assert "how many" not in escalation.ask_reply(list(escalation.EMPLOYEE_FIELDS))     # never asked
-    assert escalation.missing_question("How many people are affected, and which OS?", ["operating_system"]) \
-        == escalation.ask_reply(["operating_system"])                                  # the model may not ask it
-
-
-def test_missing_device_and_urgency_are_asked_for_together_and_kept_across_turns():
-    first_json = dict(FIELDS, device_type=None, priority=None, missing_question="")
-    second_json = dict(FIELDS, description="", device_type="desktop", priority="P3", attempted_steps=[])
-    graph, mcp, kb, llm = make(first_json, second_json)
-    first = turn(graph, "My VPN shows NX-112 since this morning. I restarted. Please open a ticket.")
-    assert first["outcome"] == "clarify" and first["draft"] is None
-    assert saved(graph)["ticket_fields"]["missing"] == ["device_type", "priority"]
-    assert "which device" in first["reply"] and "how urgent" in first["reply"]
-    assert "operating system" not in first["reply"] and "how many" not in first["reply"]   # given / never asked
-    second = turn(graph, "It's my desktop, and I have a workaround.")
-    assert second["outcome"] == "draft_proposed"
-    assert second["draft"]["description"].startswith(FIELDS["description"])   # kept from the first turn
-    assert "- Device: desktop" in second["draft"]["description"]
-    assert second["draft"]["attempted_steps"] == FIELDS["attempted_steps"]      # kept from the first turn
+def test_only_the_fields_the_employee_must_give_are_ever_asked():
+    assert escalation.EMPLOYEE_FIELDS == ("description", "location")
+    asked = escalation.ask_reply(list(escalation.EMPLOYEE_FIELDS))
+    assert "how many" not in asked and "operating system" not in asked and "urgent" not in asked
+    for question in ("How many people are affected?", "Which OS are you on?", "How urgent is it?",
+                     "Which device is it on?"):
+        assert escalation.missing_question(question, ["location"]) == escalation.ask_reply(["location"])
 
 
 def test_the_employee_comes_from_the_directory_never_from_the_model():
@@ -289,8 +288,185 @@ def test_the_employee_comes_from_the_directory_never_from_the_model():
 
 
 def test_an_incomplete_intake_never_reaches_the_approval_gate():
-    graph, mcp, kb, llm = make(dict(FIELDS, device_type=None, missing_question=""))
-    for text in ("NX-112 again. Please open a ticket.", "please just file it", "ok"):
+    graph, mcp, kb, llm = make(dict(FIELDS, missing_question=""))
+    for text in ("Please open a ticket.", "please just file it", "ok"):
         out = turn(graph, text)
         assert out["outcome"] == "clarify" and out["draft"] is None
     assert "create_ticket" not in mcp.calls
+
+
+# ------------------------------------------------------------- the operating system: the employee's, else the directory's
+
+def test_the_directory_operating_system_is_used_and_labelled_when_the_employee_gives_none():
+    graph, mcp, kb, llm = make(dict(FIELDS, operating_system=None))
+    out = turn(graph, "NX-112 again after a sync and a restart. Please open a ticket.")
+    assert out["outcome"] == "draft_proposed"
+    assert "- Operating system: Windows 11 24H2 (from directory)" in out["draft"]["description"]
+    assert "- Operating system: Windows 11 24H2 (from directory)" in out["reply"]
+
+
+def test_an_operating_system_the_employee_gave_beats_the_directory():
+    graph, mcp, kb, llm = make(dict(FIELDS, operating_system="macOS 15"))
+    out = turn(graph, "NX-112 on my macOS 15 laptop after a sync and a restart. Please open a ticket.")
+    assert "- Operating system: macOS 15\n" in out["draft"]["description"]
+    assert "from directory" not in out["draft"]["description"]
+
+
+def test_an_operating_system_the_employee_never_mentioned_does_not_count_as_theirs():
+    graph, mcp, kb, llm = make(dict(FIELDS, operating_system="macOS 15"))
+    out = turn(graph, "NX-112 again after a sync and a restart. Please open a ticket.")
+    assert "macOS" not in out["draft"]["description"]
+    assert "- Operating system: Windows 11 24H2 (from directory)" in out["draft"]["description"]
+
+
+def test_a_directory_record_without_an_operating_system_leaves_it_out(monkeypatch):
+    monkeypatch.setitem(DIRECTORY, SARA, dict(DIRECTORY[SARA], device_os=None))
+    graph, mcp, kb, llm = make(dict(FIELDS, operating_system=None))
+    out = turn(graph, "NX-112 again after a sync and a restart. Please open a ticket.")
+    assert out["outcome"] == "draft_proposed"
+    assert "- Operating system:" not in out["draft"]["description"]
+
+
+# ------------------------------------------------------------- nothing relaxed by the shorter intake
+
+class DirectoryDown(DataMCP):
+    """The directory cannot be reached; every other tool still answers."""
+
+    async def call(self, tool, args=None):
+        if tool == "lookup_employee":
+            self.calls.append(tool)
+            data = {"ok": False, "error": {"code": "helpdesk_unavailable"}}
+            return data, ToolCall(tool=tool, ok=False, ms=1)
+        return await super().call(tool, args)
+
+
+def directory_down_graph(*replies):
+    mcp, llm = DirectoryDown(), FakeChat(*replies)
+    kb = FakeKnowledgeBase(kb_result(KB002, codes=("NX-112",)))
+    return build_graph(InMemorySaver(), mcp, kb, llm), mcp, llm
+
+
+def test_an_unavailable_directory_blocks_the_draft_and_nothing_is_prefilled():
+    graph, mcp, llm = directory_down_graph(FIELDS)
+    out = turn(graph, "NX-112 after a sync and a restart. Please open a ticket.")
+    assert (out["outcome"], out["reply"], out["draft"]) == ("blocked", NO_EMPLOYEE_REPLY, None)
+    assert llm.calls == [] and "create_ticket" not in mcp.calls
+
+
+def test_an_unavailable_directory_never_lifts_a_security_refusal():
+    graph, mcp, llm = directory_down_graph(FIELDS)
+    out = turn(graph, "Please open a ticket to give me the local admin password.")
+    assert out["draft"] is None and out["outcome"] in ("blocked", "policy_refusal") and llm.calls == []
+
+
+def test_the_model_can_never_set_p1_and_the_rules_still_can():
+    graph, mcp, kb, llm = make(dict(FIELDS, priority="P1"))
+    out = turn(graph, "NX-112 after a sync and a restart. Please open a ticket.")
+    assert out["draft"]["priority"] == "P2"                                 # capped, not a P1
+    graph, mcp, kb, llm = make(dict(FIELDS, priority=None, affected_users=5))
+    out = turn(graph, "NX-112 for 5 of us after a sync and a restart. Please open a ticket.")
+    assert out["draft"]["priority"] == "P1"                                 # KB-015: more than 3 users, set by code
+
+
+def test_no_urgency_uses_the_rules_and_the_employee_s_own_words():
+    graph, mcp, kb, llm = make(dict(FIELDS, priority=None))
+    out = turn(graph, "NX-112 after a sync and a restart, and I cannot work. Please open a ticket.")
+    assert out["draft"]["priority"] == "P2"                                 # KB-015: blocked from working
+    graph, mcp, kb, llm = make(dict(FIELDS, priority=None))
+    out = turn(graph, "NX-112 after a sync and a restart. Please open a ticket.")
+    assert out["draft"]["priority"] == escalation.DEFAULT_PRIORITY
+
+
+# ------------------------------------------------------------- the short draft through the real approval gate
+
+@requires_api
+@pytest.mark.usefixtures("clean")
+def test_a_draft_with_nothing_optional_passes_the_gate_and_is_filed_once(client, monkeypatch):
+    bare = dict(FIELDS, device_type=None, operating_system=None, priority=None, attempted_steps=[])
+    graph = build_graph(app.state.checkpointer, mcp, FakeKnowledgeBase(kb_result(KB002, codes=("NX-112",))),
+                        FakeChat(bare))
+    monkeypatch.setattr(app.state, "graph", graph)
+    out = chat(client, "s-bare", "My VPN shows NX-112 since this morning. Please open a ticket.")
+    assert out["state"] == "await_approval" and created_tickets() == []
+    action = out["pending_action"]["action_id"]
+    first = approve(client, "s-bare", action)
+    again = approve(client, "s-bare", action)
+    assert first["state"] == "ticket_created" and "already filed" in again["reply"]
+    [ticket] = created_tickets()                                            # exactly one, valid for the ticket schema
+    assert ticket["attempted_steps"] == [STEPS_NOT_PROVIDED] and ticket["requester_email"] == SARA
+
+
+@requires_api
+@pytest.mark.usefixtures("clean")
+def test_a_rejected_short_draft_files_nothing(client, monkeypatch):
+    graph = build_graph(app.state.checkpointer, mcp, FakeKnowledgeBase(kb_result(KB002, codes=("NX-112",))),
+                        FakeChat(dict(FIELDS, device_type=None, priority=None, attempted_steps=[])))
+    monkeypatch.setattr(app.state, "graph", graph)
+    out = chat(client, "s-no", "My VPN shows NX-112 since this morning. Please open a ticket.")
+    done = approve(client, "s-no", out["pending_action"]["action_id"], approved=False)
+    assert "did not file" in done["reply"] and created_tickets() == [] and done.get("result") is None
+
+
+# ------------------------------------------------------------- the one follow-up for a vague request
+
+VAGUE = dict(FIELDS, description="My laptop is really slow today.", device_type=None, attempted_steps=[],
+             error_code=None, missing_question="")
+AFTER = dict(VAGUE, description="")
+VAGUE_REQUEST = "My laptop is really slow today. Please open a ticket."
+KB_NONE = kb_result(KB002)
+
+
+def vague_graph(*replies):
+    return make(*replies, kb=FakeKnowledgeBase(KB_NONE))
+
+
+def test_a_vague_request_gets_one_combined_question_and_no_draft():
+    graph, mcp, kb, llm = vague_graph(VAGUE)
+    out = turn(graph, VAGUE_REQUEST)
+    assert out["outcome"] == "clarify" and out["draft"] is None and "create_ticket" not in mcp.calls
+    assert "error code" in out["reply"] and "tried" in out["reply"] and "don't know" in out["reply"]
+    assert "which device" not in out["reply"]                  # "laptop" is in the request: never asked for
+
+
+def test_i_dont_know_leads_to_a_draft_and_nothing_is_asked_twice():
+    for answer in ("I don't know.", "Not applicable", "n/a"):
+        graph, mcp, kb, llm = vague_graph(VAGUE, AFTER)
+        first = turn(graph, VAGUE_REQUEST)
+        out = turn(graph, answer)
+        assert first["outcome"] == "clarify" and out["outcome"] == "draft_proposed"
+        assert out["draft"]["attempted_steps"] == [STEPS_NOT_PROVIDED] and "- Error code:" not in out["draft"]["description"]
+        assert "create_ticket" not in mcp.calls
+
+
+def test_answers_are_kept_and_earlier_values_are_not_lost():
+    graph, mcp, kb, llm = vague_graph(VAGUE, dict(AFTER, attempted_steps=["Restarted it twice"]))
+    turn(graph, VAGUE_REQUEST)
+    out = turn(graph, "I restarted it twice.")
+    assert out["outcome"] == "draft_proposed" and out["draft"]["attempted_steps"] == ["Restarted it twice"]
+    assert out["draft"]["description"].startswith(VAGUE["description"])
+
+
+def test_only_details_the_employee_can_add_are_asked_and_directory_facts_never():
+    graph, mcp, kb, llm = vague_graph(dict(VAGUE, description="Something is really slow today."))
+    out = turn(graph, "Something is really slow today. Please open a ticket.")
+    assert "which device" in out["reply"]
+    assert "operating system" not in out["reply"] and "where you are" not in out["reply"]
+
+
+def test_an_error_code_alone_is_not_a_clear_problem():
+    graph, mcp, kb, llm = make(dict(FIELDS, missing_question=""))
+    out = turn(graph, "NX-112. Please open a ticket.")
+    assert (out["outcome"], out["reply"], out["draft"]) == ("clarify", ASK_DESCRIPTION_REPLY, None)
+
+
+def test_an_error_code_or_step_the_employee_never_gave_does_not_skip_the_question():
+    invented = dict(VAGUE, error_code="NX-999", attempted_steps=["Reinstalled the graphics driver"])
+    graph, mcp, kb, llm = vague_graph(invented)
+    out = turn(graph, VAGUE_REQUEST)
+    assert out["outcome"] == "clarify" and out["draft"] is None
+
+
+def test_a_finance_vpn_problem_is_never_asked_for_steps():
+    graph, mcp, kb, llm = make(dict(FIELDS, attempted_steps=[], category="security"))
+    out = turn(graph, "My VPN keeps dropping when I connect from home. Please open a ticket.", email=FADI)
+    assert out["outcome"] == "draft_proposed" and out["draft"]["category"] == "security"

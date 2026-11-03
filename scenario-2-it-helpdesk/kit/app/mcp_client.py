@@ -31,7 +31,7 @@ log = logging.getLogger("helpdesk-app.mcp")
 
 # Authorization is decided here, in code. Graph nodes get the read tools only; the one write tool the app
 # uses (create_ticket) also needs approved=True, which only /api/approve passes. Any other tool is refused.
-READ_TOOLS = frozenset({"lookup_employee", "get_service_status", "search_tickets"})
+READ_TOOLS = frozenset({"lookup_employee", "get_service_status", "search_tickets", "get_ticket"})
 APPROVED_WRITE_TOOLS = frozenset({"create_ticket"})
 # The app's own MCP server for the employee's ticket history (app/tickets_mcp.py): one read tool, no writes.
 MY_TICKETS_TOOLS = frozenset({"get_my_tickets"})

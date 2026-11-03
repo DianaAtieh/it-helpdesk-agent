@@ -567,8 +567,9 @@ def ticket_card(pending: dict | None) -> str:
         lines.append(f"- **Department** {payload['department']}")
     if payload.get("requester_email"):
         lines.append(f"- **Requester** `{payload['requester_email']}`")
-    if payload.get("attempted_steps"):
-        lines.append("- **Already tried** " + "; ".join(map(str, payload["attempted_steps"])))
+    tried = [str(step) for step in payload.get("attempted_steps") or [] if step != STEPS_NOT_PROVIDED]
+    if tried:
+        lines.append("- **Already tried** " + "; ".join(tried))
     if "kb_refs" in payload:
         lines.append("- **Related articles** " + (" ".join(f"`{ref}`" for ref in payload["kb_refs"]) or "none"))
     if payload.get("description"):
@@ -595,6 +596,8 @@ def send(message: str, history: list, session_id: str, email: str, auth: dict | 
     """Sync fallback path (POST /api/chat), kept for the case where the WebSocket is unavailable."""
     if not message.strip():
         return ("", history, *[gr.skip()] * 7, gr.skip())
+    if not session_id:                  # the page is still starting: the message stays in the box
+        return (gr.skip(), history, *[gr.skip()] * 7, gr.skip())
     body = {"session_id": session_id, "message": message}
     email = login_email(email, request)
     if email:
@@ -624,6 +627,9 @@ async def send_stream(message: str, history: list, session_id: str, email: str, 
     """The chat handler: shows the answer while the model is still generating it (WebSocket /ws/chat)."""
     if not message.strip():
         yield ("", history, *[gr.skip()] * 7, gr.skip())
+        return
+    if not session_id:                  # the page is still starting: the message stays in the box
+        yield (gr.skip(), history, *[gr.skip()] * 7, gr.skip())
         return
     body = {"session_id": session_id, "message": message}
     email = login_email(email, request)
@@ -686,8 +692,10 @@ def decide(approved: bool, history: list, session_id: str, pending: dict | None,
 PREF_LABELS = (("language", "Language"), ("verbosity", "Answer length"), ("format", "Answer format"))
 PREF_VALUES = {"en": "English", "short": "short", "normal": "normal", "detailed": "detailed",
                "numbered": "numbered steps", "bullets": "bullet points", "prose": "plain prose"}
+# The ticket contract needs one step; this one means the employee named none (app/agent/escalation.py).
+STEPS_NOT_PROVIDED = "Not provided by the employee"
 PREF_NOTE = ("_Preferences only change how answers are written, never facts, policies or tickets. "
-             "The email you type is not verified: this is a demo without login._")
+             "._")
 PREF_NO_SESSION = "Your conversation is still starting. Try again in a moment."
 PREF_LOADING = "### Saved Preferences\n_Loading your saved preferences..._"
 PREF_ERRORS = {
@@ -865,13 +873,17 @@ def render_ticket_cards(tickets: list | None, selected: dict | None = None) -> s
     """One card per ticket (ID, issue, status, approval, created, updated), each record once. Text is escaped."""
     seen, cards = set(), []
     for t in tickets or []:
-        if not isinstance(t, dict) or t.get("action_id") in seen:
+        if not isinstance(t, dict) or (t.get("action_id") and t["action_id"] in seen):   # no identifier: never merged
             continue
         seen.add(t.get("action_id"))
         approval = APPROVAL_BADGES.get(t.get("approval"), (str(t.get("approval") or ""), "neutral"))
         status = TICKET_STATUS_BADGES.get(t.get("status"), ("Not filed", "neutral"))
         ticket_id = html.escape(str(t.get("ticket_id") or "No ticket ID"))
         issue = html.escape(" ".join(str(t.get("description") or t.get("subject") or "").split())[:220])
+        # Not an IT number: that one is the helpdesk's and may repeat after it restarts.
+        ref = str(t.get("action_id") or "").removeprefix("act-").upper()
+        ref = f"{ref[:16]}.{ref[16:]}" if len(ref) == 32 else ref     # as app/tickets.py reference()
+        ref_line = f"<div class='nk-muted'>Application Reference: REF-{html.escape(ref)}</div>" if ref else ""
         cards.append(
             f"<div class='nk-ticket-card' data-approval='{html.escape(str(t.get('approval') or ''))}' "
             f"data-status='{html.escape(str(t.get('status') or ''))}'>"
@@ -879,7 +891,7 @@ def render_ticket_cards(tickets: list | None, selected: dict | None = None) -> s
             f"<div>{_badge(*status)} {_badge(*approval)}</div>"
             f"<div class='nk-muted'>{issue}</div>"
             f"<div class='nk-muted'>Created {html.escape(str(t.get('created_at') or ''))} · "
-            f"Updated {html.escape(str(t.get('updated_at') or ''))}</div></div>")
+            f"Updated {html.escape(str(t.get('updated_at') or ''))}</div>{ref_line}</div>")
     if not cards:
         return f"<div class='nk-empty'><b>You don't have any {html.escape(ticket_filter_text(selected))}.</b></div>"
     return "\n".join(cards)
@@ -899,26 +911,43 @@ def open_tickets_page(page: str, session_id: str, auth: dict | None):
     return fetch_my_tickets(session_id, auth) if page == NAV_PAGES[2] else gr.skip()
 
 
-def start_session(session_id: str, email: str = "", request: gr.Request | None = None):
-    """On sign-in and on every new chat (a page load): link this tab's NEW conversation to the signed-in employee
-    with POST /api/session/start and keep the session token it issues. Nothing is sent without a signed-in email.
-    If a first chat message got there first, its token is already in auth_state: that is left untouched."""
+def start_session(email: str = "", request: gr.Request | None = None):
+    """-> (session id, auth). On sign-in and on every new chat (a page load): this tab's NEW conversation id, created
+    HERE with its token, so the two can never disagree. A gr.State with a callable default is no use for this: its
+    value is built once for all tabs and replaced by a page-load event of its own, racing with this one.
+    Links the conversation to the signed-in employee with POST /api/session/start. Without a token (no signed-in
+    email, or the app could not start it) the id is still set: the first chat message then starts it as before."""
+    session_id = f"ui-{uuid.uuid4().hex}"           # 128 random bits: the id is all that proves the session
     signed_in = login_email(email, request)
     if not signed_in:
-        return gr.skip()
+        return session_id, None
     data, issued = call_app("/api/session/start", {"session_id": session_id, "user": {"email": signed_in}})
     if not issued:
         ui_log.info("session start: no token issued (%s)", str(data.get("status") or data.get("detail") or "")[:80])
-        return gr.skip()
-    return {"session_id": session_id, "token": issued}
+        return session_id, None
+    return session_id, {"session_id": session_id, "token": issued}
+
+
+START_FAILED = "Your session could not be started, so this could not be loaded. Refresh the page to try again."
 
 
 def load_preferences_on_start(session_id: str, auth: dict | None):
-    """The saved preferences panel right after the session starts (no message needed)."""
+    """The saved preferences panel right after the session starts (no message needed). Never left on "Loading...":
+    a failed start or load says so."""
+    if not auth:
+        return f"### Saved Preferences\n⚠️ {START_FAILED}"
     ok, data = call_preferences("GET", "/preferences", session_id, auth)
     if ok and isinstance(data.get("preferences"), dict):
         return render_preferences(data["preferences"])
-    return gr.skip()
+    reason = data if not ok else "The app sent an answer that could not be read."
+    return f"### Saved Preferences\n⚠️ Could not load your preferences. {reason}"
+
+
+def load_tickets_on_start(session_id: str, auth: dict | None) -> str:
+    """The My Tickets page right after the session starts (no message needed). A failed start or load says so."""
+    if not auth:
+        return f"<div class='nk-empty'><b>{html.escape(START_FAILED)}</b></div>"
+    return fetch_my_tickets(session_id, auth)
 
 
 def refresh_tickets_page(session_id: str, auth: dict | None):
@@ -965,7 +994,7 @@ HELP_HTML = """
 
 
 with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as demo:
-    session = gr.State(lambda: f"ui-{uuid.uuid4().hex}")  # 128 random bits: the id is all that proves the session
+    session = gr.State(None)          # set by start_session on every page load, together with its token
     pending_state = gr.State(None)
     auth_state = gr.State(None)       # {"session_id", "token"}: per tab, server-side, never sent to the browser
     prefs_seen = gr.State(0)          # chat length already checked for a save confirmation (refresh_after_confirmed_save)
@@ -1070,9 +1099,14 @@ with gr.Blocks(title="NAKHLA · Intelligent IT Helpdesk", fill_width=True) as de
     demo.load(profile_card, None, profile)
     # Sign-in and every new chat (a page load): start the conversation for the signed-in employee, then show their
     # saved preferences and tickets without waiting for a first message.
-    started = demo.load(start_session, [session, email], auth_state)
+    started = demo.load(start_session, email, [session, auth_state])
     started.then(load_preferences_on_start, [session, auth_state], prefs_panel)
-    started.then(refresh_tickets_page, [session, auth_state], tickets_md)
+    started.then(load_tickets_on_start, [session, auth_state], tickets_md)
+
+# Gradio runs each event one at a time by default, so one employee's reply would wait for another's. Everything per
+# employee is in gr.State (one per browser session) and each turn opens its own connection, so turns can overlap; the
+# backend still runs the turns of one conversation one after another.
+demo.queue(default_concurrency_limit=int(os.getenv("UI_CONCURRENCY_LIMIT") or 20))
 
 if __name__ == "__main__":
     import users                      # ui/users.py: the demo login accounts (python ui/users.py add-all)

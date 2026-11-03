@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.agent import nodes
-from app.agent.escalation import ASK_STEPS_REPLY, FINANCE_VPN_REPLY, FINANCE_VPN_STEP
+from app.agent.escalation import ASK_STEPS_REPLY, FINANCE_VPN_REPLY, FINANCE_VPN_STEP, STEPS_NOT_PROVIDED
 from app.agent.nodes import FINANCE_VPN_DOCS, FINANCE_VPN_OUTCOME, valid_finance_vpn_citations
 from tests.fakes import FakeChat, FakeKnowledgeBase, evidence, kb_result
 from tests.test_escalate_graph import FADI, FIELDS, SARA, ZIAD, make, systems, turn
@@ -76,10 +76,10 @@ def test_an_explicit_finance_ticket_request_is_unchanged():
     assert out["draft"]["priority"] == "P2" and systems(llm) == ["escalate"]
 
 
-def test_a_non_finance_ticket_request_after_any_reply_still_needs_steps():
+def test_a_non_finance_ticket_request_never_gets_the_finance_step():
     graph, *_ = finance_graph(SECURITY_FIELDS)
     out = turn(graph, "NakhlaConnect shows NX-781. Please open a ticket.", email=KARIM)
-    assert out["reply"] == ASK_STEPS_REPLY and out.get("draft") is None
+    assert out["draft"]["attempted_steps"] == [STEPS_NOT_PROVIDED]
 
 
 # ------------------------------------------------------------------ everything else is unchanged
