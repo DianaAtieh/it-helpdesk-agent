@@ -17,7 +17,7 @@ from langgraph.config import get_config, get_stream_writer
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app import timing  # noqa: E402
-from app.agent import access, answer_verifier, escalation, my_tickets, policy
+from app.agent import access, answer_verifier, escalation, incident_query, my_tickets, policy
 from app.agent.codes import classify_codes, is_ambiguous, without_codes
 from app.agent.preferences import is_preference_only, strip_preference_claims
 from app.agent.prompts import (ESCALATION_SYSTEM_PROMPT, STREAM_SYSTEM_PROMPT, SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT,
@@ -186,6 +186,60 @@ def _services_for(topics: list[str], services: list[dict]) -> list[dict]:
     return [s for s in services if any(n in f"{s['id']} {s['name']}".lower() for n in needles)]
 
 
+NOT_A_TICKET_NOTE = ("{ids} is a status-page incident, not a helpdesk ticket. If you want your own tickets, ask me "
+                     "to show your tickets.")
+
+
+def _incident_detail(incident: dict, services: list[dict], employee: dict | None) -> str:
+    """One active incident for a status question about incidents. The general workaround is withheld for VPN when a
+    department rule (Finance, Contractors) overrides it, exactly as in service_status_reply."""
+    name = next((s["name"] for s in services if s["id"] == _clean(incident.get("service"), 40).lower()), "")
+    detail = (f"Active incident {_clean(incident.get('id'), 40)} ({_clean(incident.get('priority'), 8) or '?'}): "
+              f"{_clean(incident.get('title')) or 'service problem'}.")
+    if name:
+        detail += f" Affected service: {name}."
+    if _clean(incident.get("service"), 40).lower() == "vpn" and vpn_restricted(employee):
+        detail += " Your VPN access follows a department rule, so general workarounds do not apply to you."
+        return detail + (" Contractors do not use the VPN; see the VDI instructions."
+                         if employee.get("contractor") else " Please contact Security Operations through the Service Desk.")
+    if incident.get("workaround"):
+        detail += f" Workaround: {_clean(incident['workaround'])}"
+    if incident.get("instructions"):
+        detail += f" {_clean(incident['instructions'])}"
+    return detail
+
+
+def incident_scope_reply(state: AgentState) -> str:
+    """The reply to a status question about incidents or gateways (state["status_scope"]), from the status page only.
+    No model, and it never invents an incident or says a gateway is fine without the page showing no problem."""
+    scope = state.get("status_scope") or {}
+    services = [s for s in state.get("services") or [] if isinstance(s, dict)]
+    incidents = [i for i in state.get("incidents") or [] if isinstance(i, dict)]
+    employee = state.get("employee")
+    lines: list[str] = []
+    wanted = scope.get("incidents") or []
+    for incident_id in wanted:
+        found = next((i for i in incidents if str(i.get("id")).upper() == incident_id), None)
+        lines.append(_incident_detail(found, services, employee) if found
+                     else f"The status page shows no active incident {incident_id}.")
+    for gateway in scope.get("gateways") or []:
+        pattern = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(gateway)}(?![A-Za-z0-9])")
+        parts = [c for s in services for c in s.get("components") or [] if pattern.search(c.get("name") or "")]
+        lines.append(f"{parts[0]['name']} is currently reported as {parts[0]['status']}." if parts else
+                     f"The status page currently reports no problem for {gateway}.")
+        if not wanted:
+            lines += [_incident_detail(i, services, employee) for i in incidents if pattern.search(str(i.get("title")))]
+    if not wanted and not scope.get("gateways"):
+        lines += [_incident_detail(i, services, employee) for i in incidents]
+        lines += [f"{s['name']} is currently reported as {s['status']}."
+                  for s in services if s["status"] in ("degraded", "down") and not incidents]
+        if not lines:
+            lines.append("The status page shows no active incidents right now.")
+    if scope.get("ticket_word") and wanted:
+        lines.append(NOT_A_TICKET_NOTE.format(ids=", ".join(wanted)))
+    return "\n".join(lines)
+
+
 def service_status_reply(state: AgentState) -> str:
     """The reply to a status question, from the status page only (no model). It never says "operational"
     without that status from the page, and never invents an incident."""
@@ -193,6 +247,8 @@ def service_status_reply(state: AgentState) -> str:
               "down. Please try again in a moment or check the IT status page.")
     if not state.get("status_checked"):
         return cannot
+    if state.get("status_scope"):
+        return incident_scope_reply(state)
     matched = _services_for(state.get("status_topics") or [], state.get("services") or [])
     if not matched:
         return cannot
@@ -351,6 +407,16 @@ def make_triage(mcp: MCPClient, llm: ChatModel | None = None) -> Callable[[Agent
         # "Show me my open tickets": the employee's own ticket list (my_tickets node, get_my_tickets over MCP).
         show_tickets = not matched and not policy_hit and my_tickets.is_request(text)
         wants_ticket = wants_ticket and not show_tickets
+        pattern_ticket_flow = wants_ticket or show_tickets
+        # A status question about incidents or gateways ("any ongoing incidents?", "what's happening with GW-2?").
+        # Everything that has its own flow stays out of it: a verified incident or policy hit, a service question
+        # (topics), a real error code, a how-to / fix question, a ticket request and "show my tickets". INC-n and GW-n
+        # are status-page ids: they are neither error codes nor ticket ids.
+        real_codes = [c for c in mentioned if not incident_query.is_status_identifier(c)]
+        scope = None
+        if not (matched or policy_hit or topics or real_codes or pattern_ticket_flow
+                or _NOT_A_STATUS_QUESTION.search(text)):
+            scope = incident_query.read_scope(text, any(p.search(text) for p, _ in STATUS_TOPICS.values()))
         # "It's fixed" in answer to the resolution question under the last answer: end there, no ticket, no model.
         resolved = (not matched and not policy_hit and not wants_ticket
                     and escalation.reports_resolved(state.get("messages") or []))
@@ -379,11 +445,21 @@ def make_triage(mcp: MCPClient, llm: ChatModel | None = None) -> Callable[[Agent
         if confirmed:
             _, previous_reply = escalation.last_messages(state.get("messages") or [])
             wants_ticket = decided.intent == "ticket"
-            show_tickets = decided.intent == "my_tickets"
+            # The model's "my_tickets" never stands for an incident id: INC-n is not a ticket id.
+            show_tickets = decided.intent == "my_tickets" and (
+                not incident_query.incident_ids(text) or bool(my_tickets._TICKET_ID.search(text))
+                or pattern_ticket_flow)
             resolved = decided.intent == "resolved" and escalation.RESOLUTION_QUESTION in (previous_reply or "")
             topics = topics if decided.intent == "status" else []      # the status reply needs a topic from code
             preference_only = preference_only and decided.intent == "preference"
             clarify_code = clarify_code and not wants_ticket
+        # A clear incident or gateway question is answered from the status page whatever the model said; a weak one
+        # (only a service or gateway noun) only when the model also reads it as a status question.
+        status_scope = None
+        if scope and not keeps_collecting and (
+                scope["tier"] == "clear" or (decided is not None and decided.intent == "status")):
+            status_scope = scope
+            show_tickets = wants_ticket = clarify_code = preference_only = False
         return {
             "employee": employee,
             "codes": codes,
@@ -392,11 +468,12 @@ def make_triage(mcp: MCPClient, llm: ChatModel | None = None) -> Callable[[Agent
             "incidents": incidents,
             "status_checked": status_checked,
             "active_incident": matched,
-            "services": status_services(data) if status_checked and topics else [],
+            "services": status_services(data) if status_checked and (topics or status_scope) else [],
             "status_topics": topics,
+            "status_scope": status_scope,
             "route": ("incident" if matched else "tickets" if show_tickets else "resolved" if resolved
                       else "clarify" if clarify_code
-                      else "status" if topics else "preference" if preference_only else "retrieve"),
+                      else "status" if topics or status_scope else "preference" if preference_only else "retrieve"),
             "tool_calls": calls,
             **({"ticket_fields": None} if left_collection else {}),
             "triage_result": {"intent": decided.intent if decided else None, "wants_ticket": bool(wants_ticket),
