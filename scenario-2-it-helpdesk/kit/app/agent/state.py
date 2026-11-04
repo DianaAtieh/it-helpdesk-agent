@@ -43,6 +43,8 @@ class AgentState(TypedDict, total=False):
     route: str
     services: list[dict]
     status_topics: list[str]
+    # A status question about incidents or gateways (nodes.make_triage, incident_query.read_scope), else None.
+    status_scope: dict | None
     # Long-term presentation preferences of the session's locked employee, loaded by /api/chat and /ws/chat on every
     # turn from app/agent/preferences.py ({} when none or no email). Only {language, verbosity, format} from the
     # whitelist; read ONLY by prompts.build_answer_input, never by routing, policy, tickets or approvals.

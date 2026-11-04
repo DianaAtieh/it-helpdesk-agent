@@ -129,8 +129,10 @@ and any other new question.
 assistant's offer to open one. A request the assistant cannot do itself ("give me my password") is NOT a ticket request.
 - "details": the employee is answering the question the assistant just asked about a ticket, including \
 "I don't know" or "not applicable".
-- "my_tickets": the employee wants to see their tickets, or the status of a ticket they name.
-- "status": the employee asks whether a service is down or has an outage, not about their own error.
+- "my_tickets": the employee wants to see their own helpdesk tickets (IT-nnnn or REF- numbers), or the status of a \
+ticket they name. INC- numbers are status-page incidents, never tickets.
+- "status": the employee asks whether a service is down or has an outage, or about incidents or gateway health \
+("any ongoing incidents?", "what's happening with GW-2?"), not about their own error.
 - "resolved": the employee says the assistant's last answer fixed the problem.
 - "preference": the message only states how answers should be written from now on.
 - "unclear": you cannot tell.
