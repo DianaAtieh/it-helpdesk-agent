@@ -62,6 +62,10 @@ The full technical design is in **[DESIGN.md](DESIGN.md)**.
 
 ## C. Architecture
 
+![Architecture of the Nakhla IT Helpdesk Agent as built: offline ingestion, the Gradio UI, the FastAPI app with the LangGraph nodes, both MCP servers, the SQLite stores, the simulated helpdesk API, OpenRouter, and the approval steps](visuals/s2-architecture-as-built.png)
+
+*The full architecture as built ([SVG version](visuals/s2-architecture-as-built.svg)). The simplified diagram below shows only how the running parts talk to each other.*
+
 ```mermaid
 flowchart LR
     U(["Employee<br/>browser"])
